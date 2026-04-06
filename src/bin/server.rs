@@ -328,7 +328,7 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
 
     let tun = tun::create(&tun_config).unwrap();
 
-    if tun_local6.is_some() {
+    if let Some(tun_local6) = tun_local6 {
         #[cfg(any(
             target_os = "openbsd",
             target_os = "freebsd",
@@ -336,9 +336,13 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
             target_os = "dragonfly",
             target_os = "macos",
         ))]
-        assign_ipv6_address(tun.name(), tun_local6.unwrap());
+        assign_ipv6_address(tun.name(), tun_local6);
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        assign_ipv6_address(tun.name(), tun_local6.unwrap(), tun_peer6.unwrap());
+        assign_ipv6_address(
+            tun.name(),
+            tun_local6,
+            tun_peer6.expect("IPv6 peer address undefined"),
+        );
     }
 
     info!("Created TUN device {}", tun.name());

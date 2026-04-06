@@ -204,6 +204,10 @@ pub fn build_tcp_packet(
 }
 
 pub fn parse_ip_packet(buf: &[u8]) -> Option<(IPPacket, tcp::TcpPacket)> {
+    if buf.is_empty() {
+        return None;
+    }
+
     #[cfg(any(
         target_os = "openbsd",
         target_os = "freebsd",
@@ -241,6 +245,135 @@ pub fn parse_ip_packet(buf: &[u8]) -> Option<(IPPacket, tcp::TcpPacket)> {
         Some((IPPacket::V6(v6), tcp))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pnet::packet::tcp;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+
+    #[test]
+    fn build_and_parse_ipv4_packet_round_trip() {
+        let local_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 1111));
+        let remote_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 2222));
+        let payload = [1u8, 2, 3, 4];
+        let mut buf = [0u8; MAX_PACKET_LEN];
+
+        let size = build_tcp_packet(
+            &mut buf,
+            local_addr,
+            remote_addr,
+            123,
+            456,
+            tcp::TcpFlags::ACK,
+            Some(&payload),
+        )
+        .unwrap();
+
+        let (ip_packet, tcp_packet) = parse_ip_packet(&buf[..size]).unwrap();
+        assert_eq!(ip_packet.get_source(), local_addr.ip());
+        assert_eq!(ip_packet.get_destination(), remote_addr.ip());
+        assert_eq!(tcp_packet.get_source(), local_addr.port());
+        assert_eq!(tcp_packet.get_destination(), remote_addr.port());
+        assert_eq!(tcp_packet.get_sequence(), 123);
+        assert_eq!(tcp_packet.get_acknowledgement(), 456);
+        assert_eq!(tcp_packet.get_flags(), tcp::TcpFlags::ACK);
+        assert_eq!(tcp_packet.payload(), &payload);
+    }
+
+    #[test]
+    fn build_and_parse_ipv6_packet_round_trip() {
+        let local_addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 1111, 0, 0));
+        let remote_addr = SocketAddr::V6(SocketAddrV6::new(
+            "2001:db8::1".parse().unwrap(),
+            2222,
+            0,
+            0,
+        ));
+        let payload = [9u8, 8, 7];
+        let mut buf = [0u8; MAX_PACKET_LEN];
+
+        let size = build_tcp_packet(
+            &mut buf,
+            local_addr,
+            remote_addr,
+            321,
+            654,
+            tcp::TcpFlags::ACK,
+            Some(&payload),
+        )
+        .unwrap();
+
+        let (ip_packet, tcp_packet) = parse_ip_packet(&buf[..size]).unwrap();
+        assert_eq!(ip_packet.get_source(), local_addr.ip());
+        assert_eq!(ip_packet.get_destination(), remote_addr.ip());
+        assert_eq!(tcp_packet.get_source(), local_addr.port());
+        assert_eq!(tcp_packet.get_destination(), remote_addr.port());
+        assert_eq!(tcp_packet.get_sequence(), 321);
+        assert_eq!(tcp_packet.get_acknowledgement(), 654);
+        assert_eq!(tcp_packet.get_flags(), tcp::TcpFlags::ACK);
+        assert_eq!(tcp_packet.payload(), &payload);
+    }
+
+    #[test]
+    fn build_tcp_packet_rejects_too_small_buffer() {
+        let local_addr: SocketAddr = "127.0.0.1:1111".parse().unwrap();
+        let remote_addr: SocketAddr = "127.0.0.2:2222".parse().unwrap();
+        let payload = [1u8; 32];
+        let mut buf = [0u8; 8];
+
+        let result = build_tcp_packet(
+            &mut buf,
+            local_addr,
+            remote_addr,
+            1,
+            2,
+            tcp::TcpFlags::ACK,
+            Some(&payload),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_ip_packet_returns_none_for_empty_buffer() {
+        assert!(parse_ip_packet(&[]).is_none());
+    }
+
+    #[test]
+    fn parse_ip_packet_returns_none_for_non_tcp_ipv4_packet() {
+        let mut buf = [0u8; 20];
+        let mut packet = ipv4::MutableIpv4Packet::new(&mut buf).unwrap();
+        packet.set_version(4);
+        packet.set_header_length(5);
+        packet.set_total_length(20);
+        packet.set_next_level_protocol(ip::IpNextHeaderProtocols::Udp);
+
+        assert!(parse_ip_packet(&buf).is_none());
+    }
+
+    #[test]
+    fn build_syn_packet_sets_tcp_options_length() {
+        let local_addr: SocketAddr = "127.0.0.1:1111".parse().unwrap();
+        let remote_addr: SocketAddr = "127.0.0.2:2222".parse().unwrap();
+        let mut buf = [0u8; MAX_PACKET_LEN];
+
+        let size = build_tcp_packet(
+            &mut buf,
+            local_addr,
+            remote_addr,
+            10,
+            0,
+            tcp::TcpFlags::SYN,
+            None,
+        )
+        .unwrap();
+
+        let (_, tcp_packet) = parse_ip_packet(&buf[..size]).unwrap();
+        assert_eq!(tcp_packet.get_flags(), tcp::TcpFlags::SYN);
+        assert_eq!(tcp_packet.get_data_offset(), 6);
     }
 }
 

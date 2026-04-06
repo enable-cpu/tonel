@@ -57,6 +57,7 @@ alloc-jem = ["jemallocator"]
 benchmark = []
 
 [dev-dependencies]
+loom = "0.7"
 rand = "0.8.5"
 
 [profile.release]

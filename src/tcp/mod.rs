@@ -64,6 +64,41 @@ type SocketAsyncReceiver = kanal::AsyncReceiver<(
     usize,
 )>;
 
+enum IncomingRecvError {
+    TimedOut,
+    Closed(kanal::ReceiveError),
+}
+
+trait SeqCounter {
+    fn fetch_add_relaxed(&self, value: u32) -> u32;
+}
+
+impl SeqCounter for AtomicU32 {
+    fn fetch_add_relaxed(&self, value: u32) -> u32 {
+        self.fetch_add(value, Ordering::Relaxed)
+    }
+}
+
+fn reserve_send_seq<C: SeqCounter>(seq: &C, payload_len: usize) -> u32 {
+    seq.fetch_add_relaxed(payload_len as u32)
+}
+
+async fn recv_incoming_with_timeout(
+    incoming: &SocketAsyncReceiver,
+    timeout: time::Duration,
+) -> Result<
+    (
+        opool::RefGuard<'static, ObjectPoolAllocator, Box<[u8; MAX_PACKET_LEN]>>,
+        usize,
+    ),
+    IncomingRecvError,
+> {
+    match time::timeout(timeout, incoming.recv()).await {
+        Ok(raw_buf) => raw_buf.map_err(IncomingRecvError::Closed),
+        Err(_) => Err(IncomingRecvError::TimedOut),
+    }
+}
+
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 struct AddrTuple {
     local_addr: SocketAddr,
@@ -124,6 +159,7 @@ pub struct Socket {
 /// To close a TCP connection that is no longer needed, simply drop this object
 /// out of scope.
 impl Socket {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         _reserved_socket: Option<UdpSocket>,
         shared: Arc<Shared>,
@@ -165,9 +201,10 @@ impl Socket {
         self.remote_addr
     }
 
-    fn build_tcp_packet(
+    fn build_tcp_packet_with_seq(
         &self,
         buf: &mut [u8],
+        seq: u32,
         flags: u16,
         payload: Option<&[u8]>,
     ) -> Result<usize, String> {
@@ -177,8 +214,22 @@ impl Socket {
             buf,
             self.local_addr,
             self.remote_addr,
-            self.seq.load(Ordering::Relaxed),
+            seq,
             ack,
+            flags,
+            payload,
+        )
+    }
+
+    fn build_tcp_packet(
+        &self,
+        buf: &mut [u8],
+        flags: u16,
+        payload: Option<&[u8]>,
+    ) -> Result<usize, String> {
+        self.build_tcp_packet_with_seq(
+            buf,
+            self.seq.load(Ordering::Relaxed),
             flags,
             payload,
         )
@@ -194,7 +245,9 @@ impl Socket {
     pub async fn send(&self, buf: &mut [u8], payload: &[u8]) -> Option<()> {
         match self.state {
             State::Established => {
-                let result = self.build_tcp_packet(buf, tcp::TcpFlags::ACK, Some(payload));
+                let seq = reserve_send_seq(&self.seq, payload.len());
+                let result =
+                    self.build_tcp_packet_with_seq(buf, seq, tcp::TcpFlags::ACK, Some(payload));
                 let size = match result {
                     Ok(size) => size,
                     Err(err) => {
@@ -202,7 +255,6 @@ impl Socket {
                         return None;
                     }
                 };
-                self.seq.fetch_add(payload.len() as u32, Ordering::Relaxed);
                 self.tun.send(&buf[..size]).await.ok().and(Some(()))
             }
             _ => unreachable!(),
@@ -337,17 +389,14 @@ impl Socket {
                     trace!("Sent SYN + ACK to client");
                 }
                 State::SynReceived => {
-                    let res = time::timeout(TIMEOUT, self.incoming.recv()).await;
-                    let buf = match res {
-                        Ok(buf) => match buf {
-                            Ok(buf) => buf,
-                            Err(err) => {
-                                error!("Incoming channel recv error: {err}");
-                                break;
-                            }
-                        },
-                        Err(err) => {
-                            trace!("Waiting for client ACK timed out: {err}");
+                    let buf = match recv_incoming_with_timeout(&self.incoming, TIMEOUT).await {
+                        Ok(buf) => buf,
+                        Err(IncomingRecvError::Closed(err)) => {
+                            error!("Incoming channel recv error: {err}");
+                            break;
+                        }
+                        Err(IncomingRecvError::TimedOut) => {
+                            trace!("Waiting for client ACK timed out");
                             break;
                         }
                     };
@@ -405,17 +454,15 @@ impl Socket {
                     trace!("Sent SYN to server");
                 }
                 State::SynSent => {
-                    let res = time::timeout(TIMEOUT, self.incoming.recv()).await;
-                    let packet_buf = match res {
-                        Ok(packet_buf) => match packet_buf {
-                            Ok(packet_buf) => packet_buf,
-                            Err(err) => {
-                                trace!("incoming channel error: {err}");
-                                break;
-                            }
-                        },
-                        Err(err) => {
-                            trace!("Waiting for SYN + ACK timed out: {err}");
+                    let packet_buf = match recv_incoming_with_timeout(&self.incoming, TIMEOUT).await
+                    {
+                        Ok(packet_buf) => packet_buf,
+                        Err(IncomingRecvError::Closed(err)) => {
+                            trace!("incoming channel error: {err}");
+                            break;
+                        }
+                        Err(IncomingRecvError::TimedOut) => {
+                            trace!("Waiting for SYN + ACK timed out");
                             break;
                         }
                     };
@@ -753,5 +800,91 @@ impl Stack {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        recv_incoming_with_timeout, reserve_send_seq, IncomingRecvError, ObjectPoolAllocator,
+        SeqCounter, GLOBAL_PACKET_POOL,
+    };
+    use crate::tcp::packet::MAX_PACKET_LEN;
+    use std::time::Duration;
+    use loom::sync::atomic::{AtomicU32, Ordering};
+    use loom::sync::{Arc, Mutex};
+    use loom::thread;
+
+    impl SeqCounter for AtomicU32 {
+        fn fetch_add_relaxed(&self, value: u32) -> u32 {
+            self.fetch_add(value, Ordering::Relaxed)
+        }
+    }
+
+    #[test]
+    fn reserve_send_seq_is_unique_across_threads() {
+        loom::model(|| {
+            let seq = Arc::new(AtomicU32::new(0));
+            let reserved = Arc::new(Mutex::new(Vec::new()));
+
+            let mut handles = Vec::new();
+            for _ in 0..2 {
+                let seq = seq.clone();
+                let reserved = reserved.clone();
+                handles.push(thread::spawn(move || {
+                    let next = reserve_send_seq(&*seq, 1);
+                    reserved.lock().unwrap().push(next);
+                }));
+            }
+
+            for handle in handles {
+                handle.join().unwrap();
+            }
+
+            let mut reserved = reserved.lock().unwrap().clone();
+            reserved.sort_unstable();
+            assert_eq!(reserved, vec![0, 1]);
+        });
+    }
+
+    #[tokio::test]
+    async fn recv_incoming_times_out_after_configured_duration() {
+        let (_tx, rx) = kanal::bounded_async(1);
+        let start = std::time::Instant::now();
+        let result = recv_incoming_with_timeout(&rx, Duration::from_millis(25)).await;
+        let elapsed = start.elapsed();
+
+        assert!(matches!(result, Err(IncomingRecvError::TimedOut)));
+        assert!(elapsed >= Duration::from_millis(25));
+        assert!(elapsed < Duration::from_millis(250));
+    }
+
+    #[tokio::test]
+    async fn recv_incoming_returns_buffer_before_timeout() {
+        let (tx, rx) = kanal::bounded_async(1);
+        let mut payload = GLOBAL_PACKET_POOL.get();
+        payload[..4].copy_from_slice(&[1, 2, 3, 4]);
+        tx.send((payload, 4)).await.unwrap();
+
+        let result = recv_incoming_with_timeout(&rx, Duration::from_secs(1)).await;
+        match result {
+            Ok((payload, size)) => {
+                assert_eq!(size, 4);
+                assert_eq!(&payload[..size], &[1, 2, 3, 4]);
+            }
+            _ => panic!("expected buffered payload before timeout"),
+        }
+    }
+
+    #[tokio::test]
+    async fn recv_incoming_reports_closed_channel() {
+        let (tx, rx) = kanal::bounded_async::<(
+            opool::RefGuard<'static, ObjectPoolAllocator, Box<[u8; MAX_PACKET_LEN]>>,
+            usize,
+        )>(1);
+        drop(tx);
+
+        let result = recv_incoming_with_timeout(&rx, Duration::from_secs(1)).await;
+        assert!(matches!(result, Err(IncomingRecvError::Closed(_))));
     }
 }
