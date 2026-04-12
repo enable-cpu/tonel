@@ -2,7 +2,9 @@ use cfg_if::cfg_if;
 use clap::ArgMatches;
 use clap::{crate_version, Arg, ArgAction, Command};
 use log::{debug, error, info, trace};
+use std::fmt;
 use std::fs;
+use std::future::Future;
 use std::io;
 #[cfg(any(
     target_os = "openbsd",
@@ -14,6 +16,7 @@ use std::io;
 ))]
 use std::io::Write;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -276,9 +279,7 @@ impl ClientSessionState {
     }
 
     fn reserve_next_tcp_socket(&self, tcp_socks_len: usize) -> usize {
-        self.next_tcp_socket_index
-            .fetch_add(1, Ordering::Relaxed)
-            % tcp_socks_len
+        self.next_tcp_socket_index.fetch_add(1, Ordering::Relaxed) % tcp_socks_len
     }
 
     fn note_tcp_socket_closed(&self) -> usize {
@@ -336,6 +337,12 @@ impl ClientTcpSocket {
     }
 }
 
+impl fmt::Display for ClientTcpSocket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.socket)
+    }
+}
+
 trait ClientSocketLiveness {
     fn is_alive(&self) -> bool;
 }
@@ -369,7 +376,11 @@ fn close_tcp_socket_state(
     }
 }
 
-fn close_tcp_socket(tcp_sock: &ClientTcpSocket, session_state: &ClientSessionState, reason: &str) -> usize {
+fn close_tcp_socket(
+    tcp_sock: &ClientTcpSocket,
+    session_state: &ClientSessionState,
+    reason: &str,
+) -> usize {
     let (remaining, newly_closed) = close_tcp_socket_state(&tcp_sock.state, session_state);
     if newly_closed {
         info!(
@@ -414,29 +425,144 @@ async fn wait_for_client_udp_activity(
     }
 }
 
+type TcpSendFuture<'a> = Pin<Box<dyn Future<Output = Option<()>> + Send + 'a>>;
+type TcpRecvFuture<'a> = Pin<Box<dyn Future<Output = Option<usize>> + Send + 'a>>;
+type TcpForwardFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
+async fn send_on_live_tcp_socket_with_sender<T, S, C>(
+    tcp_socks: &[Arc<T>],
+    session_state: &ClientSessionState,
+    buf: &mut [u8],
+    payload: &[u8],
+    sender: S,
+    closer: C,
+) -> bool
+where
+    T: ClientSocketLiveness,
+    S: for<'a> Fn(&'a Arc<T>, &'a mut [u8], &'a [u8]) -> TcpSendFuture<'a>,
+    C: Fn(&Arc<T>) -> usize,
+{
+    while let Some(index) = find_next_live_tcp_socket_index(tcp_socks, session_state) {
+        let tcp_sock = &tcp_socks[index];
+        if sender(tcp_sock, buf, payload).await.is_some() {
+            return true;
+        }
+
+        if closer(tcp_sock) == 0 {
+            return false;
+        }
+    }
+
+    false
+}
+
 async fn send_on_live_tcp_socket(
     tcp_socks: &[Arc<ClientTcpSocket>],
     session_state: &ClientSessionState,
     buf: &mut [u8],
     payload: &[u8],
 ) -> bool {
-    while let Some(index) = find_next_live_tcp_socket_index(tcp_socks, session_state) {
-        let tcp_sock = &tcp_socks[index];
-        if tcp_sock.socket.send(buf, payload).await.is_some() {
-            return true;
-        }
+    send_on_live_tcp_socket_with_sender(
+        tcp_socks,
+        session_state,
+        buf,
+        payload,
+        |tcp_sock, buf, payload| Box::pin(async move { tcp_sock.socket.send(buf, payload).await }),
+        |tcp_sock| {
+            close_tcp_socket(
+                tcp_sock,
+                session_state,
+                "send failure while forwarding UDP payload",
+            )
+        },
+    )
+    .await
+}
 
-        let remaining = close_tcp_socket(
-            tcp_sock,
-            session_state,
-            "send failure while forwarding UDP payload",
-        );
-        if remaining == 0 {
-            return false;
+#[allow(clippy::too_many_arguments)]
+async fn run_tcp_connect_loop<S, H, F, R, U, C>(
+    connect: &TcpConnect,
+    tcp_sock: &S,
+    buf: &mut [u8],
+    send_handshake: H,
+    send_first_packet: F,
+    recv_tcp: R,
+    forward_udp: U,
+    udp_count: usize,
+    close_socket: C,
+) where
+    S: fmt::Display + Sync,
+    H: for<'a> Fn(&'a S, &'a mut [u8], &'a [u8]) -> TcpSendFuture<'a>,
+    F: for<'a> Fn(&'a S, &'a mut [u8], &'a [u8]) -> TcpSendFuture<'a>,
+    R: for<'a> Fn(&'a S, &'a mut [u8]) -> TcpRecvFuture<'a>,
+    U: for<'a> Fn(&'a S, usize, &'a [u8]) -> TcpForwardFuture<'a>,
+    C: Fn(&S, &str) -> usize,
+{
+    if let Some(ref packet) = *connect.handshake_packet {
+        if send_handshake(tcp_sock, buf, packet).await.is_none() {
+            error!("Failed to send handshake packet to remote, closing sub-connection.");
+            if close_socket(tcp_sock, "handshake packet send failure") == 0 {
+                connect.cancellation.cancel();
+            }
+            return;
         }
+        trace!("Sent handshake packet to: {}", tcp_sock);
     }
 
-    false
+    let mut should_receive_handshake_packet = connect.handshake_packet.is_some();
+    let mut udp_sock_index = 0usize;
+    let mut close_reason = "peer closed the TCP sub-connection";
+    let udp_rounds = udp_count.max(1);
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = connect.cancellation.cancelled() => {
+                debug!("Closing connection requested on {}, closing sub-connection", tcp_sock);
+                break;
+            }
+            res = recv_tcp(tcp_sock, buf) => {
+                match res {
+                    Some(size) => {
+                        if should_receive_handshake_packet {
+                            should_receive_handshake_packet = false;
+                            trace!("Received handshake packet to: {}", tcp_sock);
+                            if let Some(ref packet) = connect.first_packet {
+                                trace!("Sending first packet to: {}", tcp_sock);
+                                if send_first_packet(tcp_sock, buf, packet).await.is_none() {
+                                    close_reason = "failed to send first packet after handshake";
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
+
+                        if let Some(ref enc) = *connect.encryption {
+                            enc.decrypt(&mut buf[..size]);
+                        }
+                        udp_sock_index = (udp_sock_index + 1) % udp_rounds;
+                        if let Err(err) = forward_udp(tcp_sock, udp_sock_index, &buf[..size]).await {
+                            debug!(
+                                "Unable to send UDP packet on {}: {err}, closing sub-connection",
+                                tcp_sock
+                            );
+                            close_reason = "failed to forward TCP payload to UDP";
+                            break;
+                        }
+                    }
+                    None => {
+                        close_reason = "recv returned EOF";
+                        break;
+                    }
+                }
+            }
+        }
+        _ = connect.packet_received_tx.send(());
+    }
+
+    if close_socket(tcp_sock, close_reason) == 0 {
+        connect.cancellation.cancel();
+    }
 }
 
 async fn main_async(matches: ArgMatches) -> io::Result<()> {
@@ -755,7 +881,10 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
                     .await
                     {
                         ClientUdpActivity::Cancelled => {
-                            debug!("Closing connection requested on {:?}, closing connection UDP", udp_sock);
+                            debug!(
+                                "Closing connection requested on {:?}, closing connection UDP",
+                                udp_sock
+                            );
                             break;
                         }
                         ClientUdpActivity::Received(size) => {
@@ -779,11 +908,17 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
                             continue;
                         }
                         ClientUdpActivity::IdleTimeout => {
-                            debug!("No traffic seen in the last {:?} on {:?}, closing connection", UDP_SOCK_READ_DEADLINE, udp_sock);
+                            debug!(
+                                "No traffic seen in the last {:?} on {:?}, closing connection",
+                                UDP_SOCK_READ_DEADLINE, udp_sock
+                            );
                             break;
                         }
                         ClientUdpActivity::UdpError(e) => {
-                            debug!("UDP connection closed on {:?}: {e}, closing connection", udp_sock);
+                            debug!(
+                                "UDP connection closed on {:?}: {e}, closing connection",
+                                udp_sock
+                            );
                             break;
                         }
                     }
@@ -809,80 +944,46 @@ struct TcpConnect {
 
 impl TcpConnect {
     async fn handle(&self, buf: &mut [u8], tcp_sock: Arc<ClientTcpSocket>) {
-        let mut should_receive_handshake_packet = false;
-        if let Some(ref packet) = *self.handshake_packet {
-            should_receive_handshake_packet = true;
-            if tcp_sock.socket.send(buf, packet).await.is_none() {
-                error!("Failed to send handshake packet to remote, closing sub-connection.");
-                if close_tcp_socket(
-                    &tcp_sock,
-                    &self.session_state,
-                    "handshake packet send failure",
-                ) == 0 {
-                    self.cancellation.cancel();
-                }
-                return;
-            }
-            debug!("Sent handshake packet to: {}", tcp_sock.socket);
-        }
+        let udp_socks = self.udp_socks.clone();
+        let udp_count = udp_socks.len();
+        let session_state = self.session_state.clone();
 
-        let mut udp_sock_index = 0usize;
-        let mut close_reason = "peer closed the TCP sub-connection";
-        loop {
-            tokio::select! {
-                biased;
-                _ = self.cancellation.cancelled() => {
-                    debug!("Closing connection requested on {}, closing sub-connection", tcp_sock.socket);
-                    break;
-                }
-                res = tcp_sock.socket.recv(buf) => {
-                    match res {
-                        Some(size) => {
-                            if should_receive_handshake_packet {
-                                should_receive_handshake_packet = false;
-                                trace!("Received handshake packet to: {}", tcp_sock.socket);
-
-                                if let Some(ref packet) = self.first_packet {
-                                    trace!("Sending first packet to: {}", tcp_sock.socket);
-                                    if tcp_sock.socket.send(buf, packet).await.is_none() {
-                                        close_reason = "failed to send first packet after handshake";
-                                        break;
-                                    }
-                                }
-                                continue;
-                            }
-                            if let Some(ref enc) = *self.encryption {
-                                enc.decrypt(&mut buf[..size]);
-                            }
-                            udp_sock_index = (udp_sock_index + 1) % self.udp_socks.len();
-                            if let Err(e) = self.udp_socks[udp_sock_index].send(&buf[..size]).await {
-                                debug!("Unable to send UDP packet on {}: {e}, closing sub-connection", tcp_sock.socket);
-                                close_reason = "failed to forward TCP payload to UDP";
-                                break;
-                            }
-                        },
-                        None => {
-                            close_reason = "recv returned EOF";
-                            break;
-                        },
-                    }
-                },
-            };
-            _ = self.packet_received_tx.send(());
-        }
-        if close_tcp_socket(&tcp_sock, &self.session_state, close_reason) == 0 {
-            self.cancellation.cancel();
-        }
+        run_tcp_connect_loop(
+            self,
+            &*tcp_sock,
+            buf,
+            |socket, buf, packet| Box::pin(async move { socket.socket.send(buf, packet).await }),
+            |socket, buf, packet| Box::pin(async move { socket.socket.send(buf, packet).await }),
+            |socket, buf| Box::pin(async move { socket.socket.recv(buf).await }),
+            move |_, udp_index, payload| {
+                let udp_socks = udp_socks.clone();
+                Box::pin(async move {
+                    udp_socks[udp_index]
+                        .send(payload)
+                        .await
+                        .map(|_| ())
+                        .map_err(|err| err.to_string())
+                })
+            },
+            udp_count,
+            move |socket, reason| close_tcp_socket(socket, &session_state, reason),
+        )
+        .await;
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        close_tcp_socket_state, find_next_live_tcp_socket_index, wait_for_client_udp_activity,
-        ClientSessionState, ClientTcpSocketState, ClientUdpActivity,
+        close_tcp_socket_state, find_next_live_tcp_socket_index, run_tcp_connect_loop,
+        send_on_live_tcp_socket_with_sender, wait_for_client_udp_activity, Arc, ClientSessionState,
+        ClientSocketLiveness, ClientTcpSocketState, ClientUdpActivity, TcpConnect, MAX_PACKET_LEN,
     };
+    use std::collections::VecDeque;
+    use std::fmt;
     use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::{Arc as StdArc, Mutex};
     use std::time::{Duration, Instant};
     use tokio::net::UdpSocket;
     use tokio::sync::broadcast;
@@ -1010,13 +1111,49 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn client_udp_wait_prioritizes_cancellation_over_packet_signal() {
+        let udp_sock = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let peer = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        udp_sock.connect(peer.local_addr().unwrap()).await.unwrap();
+
+        let (packet_received_tx, _) = broadcast::channel(1);
+        let mut packet_received_rx = packet_received_tx.subscribe();
+        let cancellation = CancellationToken::new();
+        let mut buf_udp = [0u8; 1];
+
+        packet_received_tx.send(()).unwrap();
+        cancellation.cancel();
+
+        let outcome = wait_for_client_udp_activity(
+            &udp_sock,
+            &mut buf_udp,
+            &mut packet_received_rx,
+            &cancellation,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(matches!(outcome, ClientUdpActivity::Cancelled));
+    }
+
     #[test]
     fn close_tcp_socket_state_only_decrements_once() {
         let session_state = ClientSessionState::new(2);
         let tcp_sock_state = ClientTcpSocketState::new();
 
-        assert_eq!(close_tcp_socket_state(&tcp_sock_state, &session_state), (1, true));
-        assert_eq!(close_tcp_socket_state(&tcp_sock_state, &session_state), (1, false));
+        assert_eq!(
+            close_tcp_socket_state(&tcp_sock_state, &session_state),
+            (1, true)
+        );
+        assert_eq!(
+            close_tcp_socket_state(&tcp_sock_state, &session_state),
+            (1, false)
+        );
         assert_eq!(session_state.live_tcp_sockets(), 1);
     }
 
@@ -1029,13 +1166,28 @@ mod tests {
             ClientTcpSocketState::new(),
         ];
 
-        assert_eq!(find_next_live_tcp_socket_index(&tcp_socks, &session_state), Some(0));
-        assert_eq!(find_next_live_tcp_socket_index(&tcp_socks, &session_state), Some(1));
+        assert_eq!(
+            find_next_live_tcp_socket_index(&tcp_socks, &session_state),
+            Some(0)
+        );
+        assert_eq!(
+            find_next_live_tcp_socket_index(&tcp_socks, &session_state),
+            Some(1)
+        );
 
         close_tcp_socket_state(&tcp_socks[2], &session_state);
-        assert_eq!(find_next_live_tcp_socket_index(&tcp_socks, &session_state), Some(0));
-        assert_eq!(find_next_live_tcp_socket_index(&tcp_socks, &session_state), Some(1));
-        assert_eq!(find_next_live_tcp_socket_index(&tcp_socks, &session_state), Some(0));
+        assert_eq!(
+            find_next_live_tcp_socket_index(&tcp_socks, &session_state),
+            Some(0)
+        );
+        assert_eq!(
+            find_next_live_tcp_socket_index(&tcp_socks, &session_state),
+            Some(1)
+        );
+        assert_eq!(
+            find_next_live_tcp_socket_index(&tcp_socks, &session_state),
+            Some(0)
+        );
     }
 
     #[test]
@@ -1046,8 +1198,34 @@ mod tests {
         close_tcp_socket_state(&tcp_socks[0], &session_state);
         close_tcp_socket_state(&tcp_socks[1], &session_state);
 
-        assert_eq!(find_next_live_tcp_socket_index(&tcp_socks, &session_state), None);
+        assert_eq!(
+            find_next_live_tcp_socket_index(&tcp_socks, &session_state),
+            None
+        );
         assert_eq!(session_state.live_tcp_sockets(), 0);
+    }
+
+    #[test]
+    fn find_next_live_tcp_socket_index_wraps_after_many_reservations() {
+        let session_state = ClientSessionState::new(3);
+        let tcp_socks = vec![
+            ClientTcpSocketState::new(),
+            ClientTcpSocketState::new(),
+            ClientTcpSocketState::new(),
+        ];
+
+        for _ in 0..32 {
+            session_state.reserve_next_tcp_socket(tcp_socks.len());
+        }
+
+        assert_eq!(
+            find_next_live_tcp_socket_index(&tcp_socks, &session_state),
+            Some(2)
+        );
+        assert_eq!(
+            find_next_live_tcp_socket_index(&tcp_socks, &session_state),
+            Some(0)
+        );
     }
 
     #[test]
@@ -1055,9 +1233,267 @@ mod tests {
         let session_state = ClientSessionState::new(0);
         let tcp_sock_state = ClientTcpSocketState::new();
 
-        assert_eq!(close_tcp_socket_state(&tcp_sock_state, &session_state), (0, true));
+        assert_eq!(
+            close_tcp_socket_state(&tcp_sock_state, &session_state),
+            (0, true)
+        );
         assert_eq!(session_state.live_tcp_sockets(), 0);
-        assert_eq!(close_tcp_socket_state(&tcp_sock_state, &session_state), (0, false));
+        assert_eq!(
+            close_tcp_socket_state(&tcp_sock_state, &session_state),
+            (0, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn send_on_live_succeeds_without_closing_when_first_socket_works() {
+        let session_state = StdArc::new(ClientSessionState::new(2));
+        let sockets: Vec<_> = vec![
+            Arc::new(FakeTcpSocket::new(0, vec![Some(())])),
+            Arc::new(FakeTcpSocket::new(1, vec![Some(())])),
+        ];
+        let mut buf = [0u8; MAX_PACKET_LEN];
+        let session_state_handle = session_state.clone();
+
+        let result = send_on_live_tcp_socket_with_sender(
+            &sockets,
+            &session_state,
+            &mut buf,
+            b"hello",
+            |tcp_sock, _buf, _payload| Box::pin(async move { tcp_sock.next_send() }),
+            move |tcp_sock| close_tcp_socket_state(&tcp_sock.state, &session_state_handle).0,
+        )
+        .await;
+
+        assert!(result);
+        assert!(sockets[0].state.is_alive());
+        assert!(sockets[1].state.is_alive());
+        assert_eq!(session_state.live_tcp_sockets(), 2);
+    }
+
+    struct FakeTcpSocket {
+        id: usize,
+        state: ClientTcpSocketState,
+        send_results: Mutex<VecDeque<Option<()>>>,
+    }
+
+    impl FakeTcpSocket {
+        fn new(id: usize, responses: Vec<Option<()>>) -> Self {
+            Self {
+                id,
+                state: ClientTcpSocketState::new(),
+                send_results: Mutex::new(VecDeque::from(responses)),
+            }
+        }
+
+        fn next_send(&self) -> Option<()> {
+            self.send_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Some(()))
+        }
+    }
+
+    impl ClientSocketLiveness for FakeTcpSocket {
+        fn is_alive(&self) -> bool {
+            self.state.is_alive()
+        }
+    }
+
+    #[tokio::test]
+    async fn send_on_live_moves_to_another_socket_after_failure() {
+        let session_state = StdArc::new(ClientSessionState::new(2));
+        let sockets: Vec<_> = vec![
+            Arc::new(FakeTcpSocket::new(0, vec![None])),
+            Arc::new(FakeTcpSocket::new(1, vec![Some(())])),
+        ];
+        let mut buf = [0u8; MAX_PACKET_LEN];
+        let payload = b"failover test";
+
+        let close_log = StdArc::new(Mutex::new(Vec::new()));
+        let close_log_handle = close_log.clone();
+        let session_state_handle = session_state.clone();
+
+        let result = send_on_live_tcp_socket_with_sender(
+            &sockets,
+            &session_state,
+            &mut buf,
+            payload,
+            |tcp_sock, _buf, _payload| Box::pin(async move { tcp_sock.next_send() }),
+            move |tcp_sock| {
+                let (remaining, newly_closed) =
+                    close_tcp_socket_state(&tcp_sock.state, &session_state_handle);
+                if newly_closed {
+                    close_log_handle.lock().unwrap().push(tcp_sock.id);
+                }
+                remaining
+            },
+        )
+        .await;
+
+        assert!(result);
+        assert_eq!(session_state.live_tcp_sockets(), 1);
+        assert_eq!(&*close_log.lock().unwrap(), &[0]);
+        assert!(!sockets[0].state.is_alive());
+        assert!(sockets[1].state.is_alive());
+    }
+
+    #[tokio::test]
+    async fn send_on_live_returns_false_when_every_socket_closes() {
+        let session_state = StdArc::new(ClientSessionState::new(2));
+        let sockets: Vec<_> = vec![
+            Arc::new(FakeTcpSocket::new(0, vec![None])),
+            Arc::new(FakeTcpSocket::new(1, vec![None])),
+        ];
+        let mut buf = [0u8; MAX_PACKET_LEN];
+        let payload = b"no live sockets";
+        let session_state_handle = session_state.clone();
+
+        let result = send_on_live_tcp_socket_with_sender(
+            &sockets,
+            &session_state,
+            &mut buf,
+            payload,
+            |tcp_sock, _buf, _payload| Box::pin(async move { tcp_sock.next_send() }),
+            move |tcp_sock| close_tcp_socket_state(&tcp_sock.state, &session_state_handle).0,
+        )
+        .await;
+
+        assert!(!result);
+        assert_eq!(session_state.live_tcp_sockets(), 0);
+        assert!(!sockets[0].state.is_alive());
+        assert!(!sockets[1].state.is_alive());
+    }
+
+    struct FakeTcpLoopSocket {
+        recv_results: Mutex<VecDeque<Option<usize>>>,
+    }
+
+    impl FakeTcpLoopSocket {
+        fn new(results: Vec<Option<usize>>) -> Self {
+            Self {
+                recv_results: Mutex::new(VecDeque::from(results)),
+            }
+        }
+
+        fn next_recv(&self) -> Option<usize> {
+            self.recv_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(None)
+        }
+    }
+
+    impl fmt::Display for FakeTcpLoopSocket {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "fake-tcp-loop")
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_connect_cancelled_when_handshake_send_fails() {
+        let session_state = Arc::new(ClientSessionState::new(1));
+        let session_state_handle = session_state.clone();
+        let cancellation = CancellationToken::new();
+        let (packet_received_tx, _) = broadcast::channel(1);
+        let tcp_connect = TcpConnect {
+            udp_socks: Arc::new(Vec::new()),
+            encryption: Arc::new(None),
+            packet_received_tx,
+            handshake_packet: Arc::new(Some(vec![0x1])),
+            cancellation: cancellation.clone(),
+            first_packet: None,
+            session_state: session_state.clone(),
+        };
+        let fake_socket = FakeTcpLoopSocket::new(vec![]);
+        let mut buf = [0u8; MAX_PACKET_LEN];
+
+        run_tcp_connect_loop(
+            &tcp_connect,
+            &fake_socket,
+            &mut buf,
+            |_, _, _| Box::pin(async { None }),
+            |_, _, _| Box::pin(async { Some(()) }),
+            |_, _| Box::pin(async { Some(0) }),
+            |_, _, _| Box::pin(async { Ok(()) }),
+            1,
+            move |_, _| session_state_handle.note_tcp_socket_closed(),
+        )
+        .await;
+
+        assert!(tcp_connect.cancellation.is_cancelled());
+        assert_eq!(session_state.live_tcp_sockets(), 0);
+    }
+
+    #[tokio::test]
+    async fn tcp_connect_closes_when_first_packet_send_fails() {
+        let session_state = Arc::new(ClientSessionState::new(1));
+        let session_state_handle = session_state.clone();
+        let cancellation = CancellationToken::new();
+        let (packet_received_tx, _) = broadcast::channel(1);
+        let tcp_connect = TcpConnect {
+            udp_socks: Arc::new(Vec::new()),
+            encryption: Arc::new(None),
+            packet_received_tx,
+            handshake_packet: Arc::new(Some(vec![0x2])),
+            cancellation: cancellation.clone(),
+            first_packet: Some(vec![0x3]),
+            session_state: session_state.clone(),
+        };
+        let fake_socket = FakeTcpLoopSocket::new(vec![Some(1)]);
+        let mut buf = [0u8; MAX_PACKET_LEN];
+
+        run_tcp_connect_loop(
+            &tcp_connect,
+            &fake_socket,
+            &mut buf,
+            |_, _, _| Box::pin(async { Some(()) }),
+            |_, _, _| Box::pin(async { None }),
+            |socket, _| Box::pin(async move { socket.next_recv() }),
+            |_, _, _| Box::pin(async { Ok(()) }),
+            1,
+            move |_, _| session_state_handle.note_tcp_socket_closed(),
+        )
+        .await;
+
+        assert!(tcp_connect.cancellation.is_cancelled());
+        assert_eq!(session_state.live_tcp_sockets(), 0);
+    }
+
+    #[tokio::test]
+    async fn tcp_connect_cancels_when_forward_failure_closes_last_socket() {
+        let session_state = Arc::new(ClientSessionState::new(1));
+        let session_state_handle = session_state.clone();
+        let cancellation = CancellationToken::new();
+        let (packet_received_tx, _) = broadcast::channel(1);
+        let tcp_connect = TcpConnect {
+            udp_socks: Arc::new(Vec::new()),
+            encryption: Arc::new(None),
+            packet_received_tx,
+            handshake_packet: Arc::new(None),
+            cancellation: cancellation.clone(),
+            first_packet: None,
+            session_state: session_state.clone(),
+        };
+        let fake_socket = FakeTcpLoopSocket::new(vec![Some(1)]);
+        let mut buf = [0u8; MAX_PACKET_LEN];
+
+        run_tcp_connect_loop(
+            &tcp_connect,
+            &fake_socket,
+            &mut buf,
+            |_, _, _| Box::pin(async { Some(()) }),
+            |_, _, _| Box::pin(async { Some(()) }),
+            |socket, _| Box::pin(async move { socket.next_recv() }),
+            |_, _, _| Box::pin(async { Err("udp send failed".to_string()) }),
+            1,
+            move |_, _| session_state_handle.note_tcp_socket_closed(),
+        )
+        .await;
+
+        assert!(tcp_connect.cancellation.is_cancelled());
+        assert_eq!(session_state.live_tcp_sockets(), 0);
     }
 }
 

@@ -32,8 +32,6 @@
 //! using a channel. It is also what the client should use for
 //! sending/receiving datagrams.
 
-#![cfg_attr(feature = "benchmark", feature(test))]
-
 pub mod packet;
 
 use dashmap::{mapref::entry::Entry, DashMap, DashSet};
@@ -227,12 +225,7 @@ impl Socket {
         flags: u16,
         payload: Option<&[u8]>,
     ) -> Result<usize, String> {
-        self.build_tcp_packet_with_seq(
-            buf,
-            self.seq.load(Ordering::Relaxed),
-            flags,
-            payload,
-        )
+        self.build_tcp_packet_with_seq(buf, self.seq.load(Ordering::Relaxed), flags, payload)
     }
 
     /// Sends a datagram to the other end.
@@ -810,10 +803,13 @@ mod tests {
         SeqCounter, GLOBAL_PACKET_POOL,
     };
     use crate::tcp::packet::MAX_PACKET_LEN;
-    use std::time::Duration;
-    use loom::sync::atomic::{AtomicU32, Ordering};
-    use loom::sync::{Arc, Mutex};
-    use loom::thread;
+    use loom::sync::atomic::AtomicU32;
+    use loom::sync::{Arc as LoomArc, Mutex as LoomMutex};
+    use loom::thread as loom_thread;
+    use std::sync::atomic::{AtomicU32 as StdAtomicU32, Ordering};
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     impl SeqCounter for AtomicU32 {
         fn fetch_add_relaxed(&self, value: u32) -> u32 {
@@ -824,14 +820,14 @@ mod tests {
     #[test]
     fn reserve_send_seq_is_unique_across_threads() {
         loom::model(|| {
-            let seq = Arc::new(AtomicU32::new(0));
-            let reserved = Arc::new(Mutex::new(Vec::new()));
+            let seq = LoomArc::new(AtomicU32::new(0));
+            let reserved = LoomArc::new(LoomMutex::new(Vec::new()));
 
             let mut handles = Vec::new();
             for _ in 0..2 {
                 let seq = seq.clone();
                 let reserved = reserved.clone();
-                handles.push(thread::spawn(move || {
+                handles.push(loom_thread::spawn(move || {
                     let next = reserve_send_seq(&*seq, 1);
                     reserved.lock().unwrap().push(next);
                 }));
@@ -845,6 +841,63 @@ mod tests {
             reserved.sort_unstable();
             assert_eq!(reserved, vec![0, 1]);
         });
+    }
+
+    #[test]
+    fn reserve_send_seq_advances_by_payload_len_and_wraps() {
+        let seq = std::sync::atomic::AtomicU32::new(u32::MAX - 1);
+
+        let reserved = reserve_send_seq(&seq, 4);
+
+        assert_eq!(reserved, u32::MAX - 1);
+        assert_eq!(seq.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn reserve_send_seq_with_zero_payload_does_not_advance() {
+        let seq = std::sync::atomic::AtomicU32::new(7);
+
+        let reserved = reserve_send_seq(&seq, 0);
+
+        assert_eq!(reserved, 7);
+        assert_eq!(seq.load(std::sync::atomic::Ordering::Relaxed), 7);
+    }
+
+    #[test]
+    fn reserve_send_seq_total_advance_matches_payload_lengths() {
+        let seq = StdArc::new(StdAtomicU32::new(0));
+        let payload_lengths = [1u32, 4];
+        let reserved = StdArc::new(StdMutex::new(Vec::new()));
+
+        let mut handles = Vec::new();
+        for &payload_len in &payload_lengths {
+            let seq = seq.clone();
+            let reserved = reserved.clone();
+            handles.push(thread::spawn(move || {
+                let value = reserve_send_seq(&*seq, payload_len as usize);
+                reserved.lock().unwrap().push((value, payload_len));
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let reserved_values = reserved.lock().unwrap().clone();
+        let total_payload: u32 = payload_lengths.iter().copied().sum();
+        assert_eq!(seq.load(Ordering::Relaxed), total_payload);
+
+        let mut reserved_values = reserved_values;
+        reserved_values.sort_unstable_by_key(|entry| entry.0);
+        assert_eq!(reserved_values.first().map(|entry| entry.0), Some(0));
+        let last = reserved_values.last().unwrap();
+        assert_eq!(seq.load(Ordering::Relaxed), last.0 + last.1);
+
+        for window in reserved_values.windows(2) {
+            let (prev_val, prev_len) = window[0];
+            let (curr_val, _) = window[1];
+            assert_eq!(curr_val, prev_val + prev_len);
+        }
     }
 
     #[tokio::test]
@@ -886,5 +939,40 @@ mod tests {
 
         let result = recv_incoming_with_timeout(&rx, Duration::from_secs(1)).await;
         assert!(matches!(result, Err(IncomingRecvError::Closed(_))));
+    }
+
+    #[tokio::test]
+    async fn recv_incoming_zero_timeout_returns_timed_out() {
+        let (_tx, rx) = kanal::bounded_async(1);
+
+        let result = recv_incoming_with_timeout(&rx, Duration::ZERO).await;
+
+        assert!(matches!(result, Err(IncomingRecvError::TimedOut)));
+    }
+
+    #[tokio::test]
+    async fn recv_incoming_returns_before_timeout_when_payload_ready() {
+        let (tx, rx) = kanal::bounded_async(1);
+        let mut payload = GLOBAL_PACKET_POOL.get();
+        payload[0] = 42;
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            tx.send((payload, 1)).await.unwrap();
+        });
+
+        let start = Instant::now();
+        let result = recv_incoming_with_timeout(&rx, Duration::from_millis(200)).await;
+        let elapsed = start.elapsed();
+
+        match result {
+            Ok((payload, size)) => {
+                assert_eq!(size, 1);
+                assert_eq!(payload[0], 42);
+            }
+            _ => panic!("expected payload before timeout"),
+        }
+
+        assert!(elapsed < Duration::from_millis(200));
     }
 }

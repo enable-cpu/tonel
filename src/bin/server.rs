@@ -29,6 +29,50 @@ use tonel::utils::{assign_ipv6_address, new_udp_reuseport};
 use tonel::Encryption;
 use tun::Device;
 
+fn parse_udp_connections(value: &str) -> Result<usize, &'static str> {
+    let amount = value
+        .parse::<usize>()
+        .map_err(|_| "Unspecified number of UDP connections per each client")?;
+    if amount == 0 {
+        Err("UDP connections should be greater than or equal to 1")
+    } else {
+        Ok(amount)
+    }
+}
+
+fn format_linux_nat_rule(
+    dev_name: &str,
+    local_port: u16,
+    destination: &str,
+    insert: bool,
+) -> String {
+    let action = if insert {
+        "-t nat -I PREROUTING"
+    } else {
+        "-t nat -D PREROUTING"
+    };
+    format!(
+        "{action} -p tcp -i {dev_name} --dport {local_port} -j DNAT --to-destination {destination}"
+    )
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn build_pfctl_nat_rules(
+    int_name: &str,
+    local_port: u16,
+    peer: Ipv4Addr,
+    peer6: Option<Ipv6Addr>,
+) -> String {
+    let mut rules =
+        format!("rdr on {int_name} inet proto tcp from any to any port {local_port} -> {peer}\n");
+    if let Some(peer6) = peer6 {
+        rules.push_str(&format!(
+            "rdr on {int_name} inet6 proto tcp from any to any port {local_port} -> {peer6}\n"
+        ));
+    }
+    rules
+}
+
 cfg_if! {
     if #[cfg(all(feature = "alloc-jem", not(target_env = "msvc")))] {
         use jemallocator::Jemalloc;
@@ -284,14 +328,8 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
 
     info!("Remote address is: {}", remote_addr);
 
-    let udp_socks_amount: usize = matches
-        .get_one::<String>("udp_connections")
-        .unwrap()
-        .parse()
-        .expect("Unspecified number of UDP connections per each client");
-    if udp_socks_amount == 0 {
-        panic!("UDP connections should be greater than or equal to 1");
-    }
+    let udp_socks_amount =
+        parse_udp_connections(matches.get_one::<String>("udp_connections").unwrap()).unwrap();
 
     let encryption = matches
         .get_one::<String>("encryption")
@@ -607,6 +645,53 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
         });
     }
 }
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_udp_connections_accepts_positive_values() {
+        assert_eq!(parse_udp_connections("3").unwrap(), 3);
+    }
+
+    #[test]
+    fn parse_udp_connections_rejects_zero_and_errors() {
+        assert_eq!(
+            parse_udp_connections("0").unwrap_err(),
+            "UDP connections should be greater than or equal to 1"
+        );
+    }
+
+    #[test]
+    fn parse_udp_connections_reports_parse_errors() {
+        assert_eq!(
+            parse_udp_connections("abc").unwrap_err(),
+            "Unspecified number of UDP connections per each client"
+        );
+    }
+
+    #[test]
+    fn format_linux_nat_rule_switches_action_and_destination() {
+        let insert_rule = format_linux_nat_rule("eth0", 2222, "192.168.0.1", true);
+        let delete_rule = format_linux_nat_rule("eth0", 2222, "192.168.0.1", false);
+        assert!(insert_rule.contains("-I PREROUTING"));
+        assert!(delete_rule.contains("-D PREROUTING"));
+        assert!(insert_rule.contains("DNAT --to-destination 192.168.0.1"));
+    }
+
+    #[test]
+    fn build_pfctl_nat_rules_includes_ipv6_when_requested() {
+        let rules = build_pfctl_nat_rules(
+            "en1",
+            2222,
+            Ipv4Addr::new(10, 0, 0, 1),
+            Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+        );
+        assert!(rules.contains("inet proto tcp"));
+        assert!(rules.contains("inet6 proto tcp"));
+    }
+}
 
 #[cfg(target_os = "linux")]
 fn auto_rule(
@@ -680,27 +765,15 @@ fn auto_rule(
         None
     };
 
-    let iptables_add_rule = format!(
-        "-t nat -I PREROUTING -p tcp -i {dev_name} --dport {local_port} -j DNAT --to-destination {peer}"
-    );
-    let ip6tables_add_rule = if let Some(peer6) = peer6 {
-        format!(
-            "-t nat -I PREROUTING -p tcp -i {dev_name} --dport {local_port} -j DNAT --to-destination {peer6}"
-        )
-    } else {
-        "".into()
-    };
-
-    let iptables_del_rule = format!(
-        "-t nat -D PREROUTING -p tcp -i {dev_name} --dport {local_port} -j DNAT --to-destination {peer}"
-    );
-    let ip6tables_del_rule = if let Some(peer6) = peer6 {
-        format!(
-            "-t nat -D PREROUTING -p tcp -i {dev_name} --dport {local_port} -j DNAT --to-destination {peer6}"
-        )
-    } else {
-        "".into()
-    };
+    let iptables_add_rule = format_linux_nat_rule(dev_name, local_port, &peer.to_string(), true);
+    let iptables_del_rule = format_linux_nat_rule(dev_name, local_port, &peer.to_string(), false);
+    let ip6_peer_string = peer6.as_ref().map(|peer6| peer6.to_string());
+    let ip6tables_add_rule = ip6_peer_string
+        .as_deref()
+        .map(|destination| format_linux_nat_rule(dev_name, local_port, destination, true));
+    let ip6tables_del_rule = ip6_peer_string
+        .as_deref()
+        .map(|destination| format_linux_nat_rule(dev_name, local_port, destination, false));
 
     let status = std::process::Command::new("iptables")
         .args(iptables_add_rule.split(' '))
@@ -712,15 +785,15 @@ fn auto_rule(
         panic!("{iptables_add_rule} could not be executed successfully: {status}.");
     }
 
-    if peer6.is_some() {
+    if let Some(rule) = &ip6tables_add_rule {
         let status = std::process::Command::new("ip6tables")
-            .args(ip6tables_add_rule.split(' '))
+            .args(rule.split(' '))
             .output()
             .expect("ip6tables could not be executed.")
             .status;
 
         if !status.success() {
-            panic!("{ip6tables_add_rule} could not be executed successfully: {status}.");
+            panic!("{rule} could not be executed successfully: {status}.");
         }
     }
     Box::new(move || {
@@ -774,17 +847,19 @@ fn auto_rule(
 
         info!("Respective iptables rules removed.");
 
-        if peer6.is_some() {
+        if let Some(rule) = ip6tables_del_rule.as_ref() {
             let status = std::process::Command::new("ip6tables")
-                .args(ip6tables_del_rule.split(' '))
+                .args(rule.split(' '))
                 .output()
                 .expect("ip6tables could not be executed.")
                 .status;
 
             if !status.success() {
-                panic!("{ip6tables_del_rule} could not be executed successfully: {status}.");
+                panic!("{rule} could not be executed successfully: {status}.");
             }
+        }
 
+        if peer6.is_some() {
             info!("Respective ip6tables rules removed.");
         }
     })
@@ -882,14 +957,7 @@ fn auto_rule(
         .spawn()
         .expect("Failed to spawn pfctl process.");
 
-    let mut nat_rules =
-        format!("rdr on {int_name} inet proto tcp from any to any port {local_port} -> {peer}\n");
-    if let Some(peer6) = peer6 {
-        nat_rules += format!(
-            "rdr on {int_name} inet6 proto tcp from any to any port {local_port} -> {peer6}\n"
-        )
-        .as_str();
-    }
+    let nat_rules = build_pfctl_nat_rules(int_name, local_port, peer, peer6);
     pfctl
         .stdin
         .take()

@@ -355,6 +355,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_ip_packet_returns_none_for_non_tcp_ipv6_packet() {
+        let mut buf = [0u8; IPV6_HEADER_LEN];
+        let mut packet = ipv6::MutableIpv6Packet::new(&mut buf).unwrap();
+        packet.set_version(6);
+        packet.set_payload_length(0);
+        packet.set_next_header(ip::IpNextHeaderProtocols::Udp);
+
+        assert!(parse_ip_packet(&buf).is_none());
+    }
+
+    #[test]
     fn build_syn_packet_sets_tcp_options_length() {
         let local_addr: SocketAddr = "127.0.0.1:1111".parse().unwrap();
         let remote_addr: SocketAddr = "127.0.0.2:2222".parse().unwrap();
@@ -375,68 +386,199 @@ mod tests {
         assert_eq!(tcp_packet.get_flags(), tcp::TcpFlags::SYN);
         assert_eq!(tcp_packet.get_data_offset(), 6);
     }
+
+    #[test]
+    fn build_and_parse_ipv4_packet_without_payload() {
+        let local_addr: SocketAddr = "127.0.0.1:1111".parse().unwrap();
+        let remote_addr: SocketAddr = "127.0.0.2:2222".parse().unwrap();
+        let mut buf = [0u8; MAX_PACKET_LEN];
+
+        let size = build_tcp_packet(
+            &mut buf,
+            local_addr,
+            remote_addr,
+            123,
+            456,
+            tcp::TcpFlags::ACK,
+            None,
+        )
+        .unwrap();
+
+        let (_, tcp_packet) = parse_ip_packet(&buf[..size]).unwrap();
+        assert!(tcp_packet.payload().is_empty());
+    }
+
+    #[test]
+    fn build_tcp_packet_accepts_max_ipv4_payload_that_fits_buffer() {
+        let local_addr: SocketAddr = "127.0.0.1:1111".parse().unwrap();
+        let remote_addr: SocketAddr = "127.0.0.2:2222".parse().unwrap();
+        let payload = [7u8; MAX_PACKET_LEN - IPV4_HEADER_LEN - TCP_HEADER_LEN];
+        let mut buf = [0u8; MAX_PACKET_LEN];
+
+        let size = build_tcp_packet(
+            &mut buf,
+            local_addr,
+            remote_addr,
+            123,
+            456,
+            tcp::TcpFlags::ACK,
+            Some(&payload),
+        )
+        .unwrap();
+
+        assert_eq!(size, MAX_PACKET_LEN);
+        let (_, tcp_packet) = parse_ip_packet(&buf[..size]).unwrap();
+        assert_eq!(tcp_packet.payload(), &payload);
+    }
+
+    #[test]
+    fn parse_ip_packet_returns_none_for_invalid_ip_version() {
+        let buf = [0x70, 0, 0, 0];
+
+        assert!(parse_ip_packet(&buf).is_none());
+    }
+
+    #[test]
+    fn parse_ip_packet_returns_none_for_truncated_ipv4_tcp_packet() {
+        let local_addr: SocketAddr = "127.0.0.1:1111".parse().unwrap();
+        let remote_addr: SocketAddr = "127.0.0.2:2222".parse().unwrap();
+        let mut buf = [0u8; MAX_PACKET_LEN];
+        let size = build_tcp_packet(
+            &mut buf,
+            local_addr,
+            remote_addr,
+            123,
+            456,
+            tcp::TcpFlags::ACK,
+            None,
+        )
+        .unwrap();
+
+        assert!(parse_ip_packet(&buf[..size - 1]).is_none());
+    }
+
+    #[test]
+    fn build_tcp_packet_rejects_payload_exceeding_max_packet_size() {
+        let local_addr: SocketAddr = "127.0.0.1:1111".parse().unwrap();
+        let remote_addr: SocketAddr = "127.0.0.2:2222".parse().unwrap();
+        let extra_offset = if cfg!(any(
+            target_os = "openbsd",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "dragonfly",
+            target_os = "macos",
+            target_os = "ios"
+        )) {
+            4
+        } else {
+            0
+        };
+        let payload_len = MAX_PACKET_LEN - IPV4_HEADER_LEN - TCP_HEADER_LEN - extra_offset + 1;
+        let payload = vec![7u8; payload_len];
+        let mut buf = [0u8; MAX_PACKET_LEN];
+
+        let result = build_tcp_packet(
+            &mut buf,
+            local_addr,
+            remote_addr,
+            123,
+            456,
+            tcp::TcpFlags::ACK,
+            Some(payload.as_slice()),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_ip_packet_returns_none_for_ipv4_header_length_larger_than_buffer() {
+        let mut buf = [0u8; IPV4_HEADER_LEN];
+        buf[0] = (4 << 4) | 6;
+
+        assert!(parse_ip_packet(&buf).is_none());
+    }
+
+    #[test]
+    fn parse_ip_packet_returns_none_for_ipv6_buffer_too_short_for_header() {
+        let buf = [0x60u8; IPV6_HEADER_LEN - 1];
+
+        assert!(parse_ip_packet(&buf).is_none());
+    }
+
+    #[test]
+    fn parse_ip_packet_returns_none_for_truncated_ipv6_tcp_packet() {
+        let local_addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 1111, 0, 0));
+        let remote_addr = SocketAddr::V6(SocketAddrV6::new(
+            "2001:db8::1".parse().unwrap(),
+            2222,
+            0,
+            0,
+        ));
+        let mut buf = [0u8; MAX_PACKET_LEN];
+        let size = build_tcp_packet(
+            &mut buf,
+            local_addr,
+            remote_addr,
+            321,
+            654,
+            tcp::TcpFlags::ACK,
+            Some(&[1u8, 2, 3]),
+        )
+        .unwrap();
+
+        let truncated_size = size - TCP_HEADER_LEN;
+        assert!(parse_ip_packet(&buf[..truncated_size]).is_none());
+    }
 }
 
 #[cfg(all(test, feature = "benchmark"))]
 mod benchmarks {
-    extern crate test;
     use super::*;
-    use test::{black_box, Bencher};
+    use std::hint::black_box;
+    use std::time::Instant;
 
-    #[bench]
-    fn bench_build_tcp_packet_1460(b: &mut Bencher) {
+    const ITERATIONS: usize = 10_000;
+
+    fn run_build_tcp_packet_bench(payload_len: usize) {
         let local_addr = "127.0.0.1:1234".parse().unwrap();
         let remote_addr = "127.0.0.2:1234".parse().unwrap();
-        let payload = black_box([123u8; 1460]);
-        let mut buf = black_box([0u8; MAX_PACKET_LEN]);
-        b.iter(|| {
-            build_tcp_packet(
+        let payload = vec![123u8; payload_len];
+        let mut buf = [0u8; MAX_PACKET_LEN];
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            let size = build_tcp_packet(
                 &mut buf,
                 local_addr,
                 remote_addr,
                 123,
                 456,
                 tcp::TcpFlags::ACK,
-                Some(&payload),
+                Some(payload.as_slice()),
             )
-        });
+            .unwrap();
+            black_box(size);
+        }
+        eprintln!(
+            "build_tcp_packet payload_len={payload_len} iterations={ITERATIONS} elapsed={:?}",
+            start.elapsed()
+        );
     }
 
-    #[bench]
-    fn bench_build_tcp_packet_512(b: &mut Bencher) {
-        let local_addr = "127.0.0.1:1234".parse().unwrap();
-        let remote_addr = "127.0.0.2:1234".parse().unwrap();
-        let payload = black_box([123u8; 512]);
-        let mut buf = black_box([0u8; MAX_PACKET_LEN]);
-        b.iter(|| {
-            build_tcp_packet(
-                &mut buf,
-                local_addr,
-                remote_addr,
-                123,
-                456,
-                tcp::TcpFlags::ACK,
-                Some(&payload),
-            )
-        });
+    #[test]
+    #[ignore = "microbenchmark"]
+    fn bench_build_tcp_packet_1460() {
+        run_build_tcp_packet_bench(1460);
     }
 
-    #[bench]
-    fn bench_build_tcp_packet_128(b: &mut Bencher) {
-        let local_addr = "127.0.0.1:1234".parse().unwrap();
-        let remote_addr = "127.0.0.2:1234".parse().unwrap();
-        let payload = black_box([123u8; 128]);
-        let mut buf = black_box([0u8; MAX_PACKET_LEN]);
-        b.iter(|| {
-            build_tcp_packet(
-                &mut buf,
-                local_addr,
-                remote_addr,
-                123,
-                456,
-                tcp::TcpFlags::ACK,
-                Some(&payload),
-            )
-        });
+    #[test]
+    #[ignore = "microbenchmark"]
+    fn bench_build_tcp_packet_512() {
+        run_build_tcp_packet_bench(512);
+    }
+
+    #[test]
+    #[ignore = "microbenchmark"]
+    fn bench_build_tcp_packet_128() {
+        run_build_tcp_packet_bench(128);
     }
 }

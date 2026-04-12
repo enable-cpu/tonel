@@ -112,6 +112,12 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
+    fn xor_encryption_with_empty_key() {
+        xor_encryption_test("xor:");
+    }
+
+    #[test]
     fn xor_encryption_with_min_key() {
         let key: String = rand::thread_rng()
             .sample_iter(&rand::distributions::Alphanumeric)
@@ -139,5 +145,16 @@ mod tests {
             .map(char::from)
             .collect();
         xor_encryption_test(format!("xor:{key}").as_str());
+    }
+
+    #[test]
+    fn xor_encryption_is_case_insensitive() {
+        xor_encryption_test("XoR:secret");
+    }
+
+    #[test]
+    #[should_panic]
+    fn unsupported_encryption_panics() {
+        let _ = Encryption::from("aes:secret");
     }
 }
