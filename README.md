@@ -6,6 +6,7 @@ A Multi-Stream UDP over TCP Tunneler for Lightning-Fast Network Layer 3 Transmis
 
 - [Overview](#overview)
   - [Features](#features)
+- [Protocol Notes](#protocol-notes)
 - [Usage](#usage)
   - [Client](#client)
   - [Server](#server)
@@ -27,7 +28,8 @@ Tonel is a tool that is often used in situations where UDP is restricted or slow
 | Features                                             |             Tonel              |
 | ---------------------------------------------------- | :----------------------------: |
 | Lightning fast                                       |               ✅               |
-| Multi-Stream TCP and UDP connections per each client |               ✅               |
+| Multiple independent UDP flows                       |               ✅               |
+| Per-flow fakeTCP failover pool                       |               ✅               |
 | Arbitrary TCP handshake content                      |               ✅               |
 | Multi-threaded and concurrency                       |               ✅               |
 | Multiple TCP queues                                  |               ✅               |
@@ -36,6 +38,15 @@ Tonel is a tool that is often used in situations where UDP is restricted or slow
 | Tunneling MTU overhead                               | Only required IPv4/IPv6 header |
 | Layer 3 mode                                         |         TUN interface          |
 | Cross-Platform                                       |        Linux and macOS         |
+
+# Protocol Notes
+
+Tonel now transports raw UDP payload bytes, such as hy2 packets, over its fake TCP sub-connections.
+It does not add a Tonel-level frame header, connection identifier, or extra wire metadata.
+Each incoming UDP flow can use one of two fakeTCP strategies selected by `--tcp-mode`:
+`pool` keeps one active connection plus hot standbys for failover, while `concurrent`
+stripes payloads across all live fakeTCP connections in the flow's pool.
+The current transport notes are documented in [docs/protocol-transport.md](docs/protocol-transport.md).
 
 # Usage
 
@@ -154,7 +165,11 @@ Options:
                                        first data packet to the server.
                                        Note: ensure this file's size does not exceed the MTU of the outgoing interface.
                                        The content is always sent out in a single packet and will not be further segmented
-      --tcp-connections <number>       The number of TCP connections per each client. [default: 1]
+      --tcp-connections <number>       The number of fakeTCP connections to maintain per UDP flow.
+                                       One is active and the rest stay as hot standbys for failover. [default: 1]
+      --tcp-mode <mode>                How fakeTCP connections are used per UDP flow.
+                                       'pool' keeps one active plus hot standbys for failover.
+                                       'concurrent' stripes payloads across live connections. [default: pool]
       --udp-connections <number>       The number of UDP connections per each client. [default: 1]
       --tun-queues <number>            The number of queues for TUN interface. Default is
                                        set to 1. The platform should support multiple queues feature. [default: 1]
@@ -202,6 +217,9 @@ Options:
                                        first data packet to the client.
                                        Note: ensure this file's size does not exceed the MTU of the outgoing interface.
                                        The content is always sent out in a single packet and will not be further segmented
+      --tcp-mode <mode>                How grouped fakeTCP connections are used per UDP flow.
+                                       'pool' keeps one active plus hot standbys for failover.
+                                       'concurrent' stripes return traffic across live connections. [default: pool]
       --encryption <encryption>        Specify an encryption algorithm for using in TCP connections.
                                        Server and client should use the same encryption.
                                        Currently XOR is only supported and the format should be 'xor:key'.

@@ -17,6 +17,7 @@ SCENARIOS=(
   "asymmetric_server_egress||delay 120ms 20ms loss 5%|--attempts 10 --timeout-ms 1800|||"
   "brief_client_blackhole|||--attempts 20 --timeout-ms 1500 --start-delay-ms 300|client:loss 100%:1.5|||"
   "brief_server_blackhole|||--attempts 20 --timeout-ms 1500 --start-delay-ms 300|server:loss 100%:1.5|||"
+  "parallel_clients|delay 20ms 5ms|delay 20ms 5ms|--parallel-clients 6 --messages 10 --attempts 10 --timeout-ms 1500 --pause-between-messages-ms 20|||"
   "idle_gap_under_threshold|||--messages 4 --attempts 12 --timeout-ms 1500 --pause-between-messages-ms 5000|||"
   "large_payload_loss_jitter|delay 80ms 10ms loss 2%|delay 80ms 10ms loss 2%|--messages 24 --attempts 12 --timeout-ms 2200 --pause-between-messages-ms 80 --payload-size 1400|||"
   "soak_loss_jitter|delay 60ms 15ms loss 2%|delay 60ms 15ms loss 2%|--messages 120 --attempts 10 --timeout-ms 1500 --pause-between-messages-ms 100|||"
@@ -236,7 +237,7 @@ run_scenario() {
     -w /work \
     "$IMAGE_TAG" \
     /bin/sh -lc \
-    "exec /work/target/release/tonelc -4 --local 127.0.0.1:1111 --remote server:2222 --tcp-connections 2 --auto-rule eth0 --log-level debug" \
+    "exec /work/target/release/tonelc -4 --local 127.0.0.1:1111 --remote server:2222 --tcp-connections 3 --auto-rule eth0 --log-level debug" \
     >/dev/null
 
   wait_for_server "$server_name"

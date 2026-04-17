@@ -130,8 +130,16 @@ fn main() {
                 .long("tcp-connections")
                 .required(false)
                 .value_name("number")
-                .help("The number of TCP connections per each client.")
+                .help("The number of fakeTCP connections to maintain per UDP flow. One is active and the rest stay as hot standbys for failover.")
                 .default_value("1")
+        )
+        .arg(
+            Arg::new("tcp_mode")
+                .long("tcp-mode")
+                .required(false)
+                .value_name("mode")
+                .help("How fakeTCP connections are used per UDP flow. 'pool' keeps one active plus hot standbys for failover. 'concurrent' stripes payloads across live connections.")
+                .default_value("pool")
         )
         .arg(
             Arg::new("udp_connections")
@@ -261,6 +269,20 @@ enum ClientUdpActivity {
     UdpError(io::Error),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TcpMode {
+    Pool,
+    Concurrent,
+}
+
+fn parse_tcp_mode(value: &str) -> Result<TcpMode, &'static str> {
+    match value {
+        "pool" => Ok(TcpMode::Pool),
+        "concurrent" => Ok(TcpMode::Concurrent),
+        _ => Err("TCP mode should be either 'pool' or 'concurrent'"),
+    }
+}
+
 struct ClientSessionState {
     live_tcp_sockets: AtomicUsize,
     next_tcp_socket_index: AtomicUsize,
@@ -299,6 +321,26 @@ impl ClientSessionState {
     }
 }
 
+struct ClientFlowPoolState {
+    primary_tcp_socket_index: AtomicUsize,
+}
+
+impl ClientFlowPoolState {
+    fn new(primary_tcp_socket_index: usize) -> Self {
+        Self {
+            primary_tcp_socket_index: AtomicUsize::new(primary_tcp_socket_index),
+        }
+    }
+
+    fn primary_tcp_socket_index(&self, tcp_socks_len: usize) -> usize {
+        self.primary_tcp_socket_index.load(Ordering::Acquire) % tcp_socks_len.max(1)
+    }
+
+    fn set_primary_tcp_socket_index(&self, index: usize) {
+        self.primary_tcp_socket_index.store(index, Ordering::Release);
+    }
+}
+
 struct ClientTcpSocketState {
     alive: AtomicBool,
 }
@@ -320,13 +362,15 @@ impl ClientTcpSocketState {
 }
 
 struct ClientTcpSocket {
+    index: usize,
     socket: Arc<Socket>,
     state: ClientTcpSocketState,
 }
 
 impl ClientTcpSocket {
-    fn new(socket: Socket) -> Self {
+    fn new(index: usize, socket: Socket) -> Self {
         Self {
+            index,
             socket: Arc::new(socket),
             state: ClientTcpSocketState::new(),
         }
@@ -479,6 +523,88 @@ async fn send_on_live_tcp_socket(
     .await
 }
 
+fn find_next_live_tcp_socket_from<T: ClientSocketLiveness>(
+    tcp_socks: &[T],
+    start_index: usize,
+) -> Option<usize> {
+    if tcp_socks.is_empty() {
+        return None;
+    }
+
+    for offset in 0..tcp_socks.len() {
+        let index = (start_index + offset) % tcp_socks.len();
+        if tcp_socks[index].is_alive() {
+            return Some(index);
+        }
+    }
+
+    None
+}
+
+fn close_tcp_socket_and_failover(
+    tcp_sock: &ClientTcpSocket,
+    tcp_socks: &[Arc<ClientTcpSocket>],
+    session_state: &ClientSessionState,
+    flow_state: &ClientFlowPoolState,
+    reason: &str,
+) -> usize {
+    let remaining = close_tcp_socket(tcp_sock, session_state, reason);
+    if remaining == 0 {
+        return 0;
+    }
+
+    if flow_state.primary_tcp_socket_index(tcp_socks.len()) == tcp_sock.index {
+        if let Some(new_primary) = find_next_live_tcp_socket_from(tcp_socks, tcp_sock.index + 1) {
+            flow_state.set_primary_tcp_socket_index(new_primary);
+            info!(
+                "Failing over UDP flow from fakeTCP {} to {}",
+                tcp_sock.index, new_primary
+            );
+        }
+    }
+
+    remaining
+}
+
+async fn send_on_primary_tcp_socket(
+    tcp_socks: &[Arc<ClientTcpSocket>],
+    session_state: &ClientSessionState,
+    flow_state: &ClientFlowPoolState,
+    buf: &mut [u8],
+    payload: &[u8],
+) -> bool {
+    if tcp_socks.is_empty() {
+        return false;
+    }
+
+    loop {
+        let primary_index = flow_state.primary_tcp_socket_index(tcp_socks.len());
+        let primary_index = match find_next_live_tcp_socket_from(tcp_socks, primary_index) {
+            Some(index) => {
+                if index != primary_index {
+                    flow_state.set_primary_tcp_socket_index(index);
+                }
+                index
+            }
+            None => return false,
+        };
+        let tcp_sock = &tcp_socks[primary_index];
+        if tcp_sock.socket.send(buf, payload).await.is_some() {
+            return true;
+        }
+        if close_tcp_socket_and_failover(
+            tcp_sock,
+            tcp_socks,
+            session_state,
+            flow_state,
+            "send failure while forwarding UDP payload",
+        ) == 0
+        {
+            return false;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_tcp_connect_loop<S, H, F, R, U, C>(
     connect: &TcpConnect,
@@ -610,6 +736,9 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
             }),
         )
     };
+
+    let tcp_mode = parse_tcp_mode(matches.get_one::<String>("tcp_mode").unwrap())
+        .expect("Invalid tcp mode");
 
     let tcp_socks_amount: usize = matches
         .get_one::<String>("tcp_connections")
@@ -781,44 +910,44 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
 
         let cancellation = CancellationToken::new();
         let (packet_received_tx, _) = broadcast::channel(1);
-
         let tcp_socks: Arc<Vec<_>> = {
             let mut socks = Vec::with_capacity(tcp_socks_amount);
             let mut set = JoinSet::new();
-            let mut first_connection = true;
             let mut first_port = 0u16;
-            for i in 0..tcp_socks_amount {
-                debug!("Creating tcp stream {i} to {remote_addr} for {addr}.");
-                let stack = stack.clone();
-                if first_connection {
-                    let mut buf = [0u8; MAX_PACKET_LEN];
-                    let res = stack.connect(&mut buf, remote_addr, 0).await;
-                    let tcp_sock = if let Some((tcp_sock, port)) = res {
-                        first_port = port;
-                        Arc::new(ClientTcpSocket::new(tcp_sock))
-                    } else {
-                        error!("Unable to connect a tcp sock to remote {remote_addr} for {addr}");
-                        continue 'main_loop;
-                    };
-                    socks.push(tcp_sock);
-                    first_connection = false;
-                    continue;
+
+            debug!("Creating primary tcp stream to {remote_addr} for {addr}.");
+            let primary = {
+                let mut buf = [0u8; MAX_PACKET_LEN];
+                let res = stack.connect(&mut buf, remote_addr, 0).await;
+                if let Some((tcp_sock, port)) = res {
+                    first_port = port;
+                    Arc::new(ClientTcpSocket::new(0, tcp_sock))
+                } else {
+                    error!("Unable to connect a tcp sock to remote {remote_addr} for {addr}");
+                    continue 'main_loop;
                 }
+            };
+            socks.push(primary);
+
+            for index in 1..tcp_socks_amount {
+                debug!(
+                    "Creating standby tcp stream {index} to {remote_addr} for {addr} using pool key {first_port}."
+                );
+                let stack = stack.clone();
                 set.spawn(async move {
                     let mut buf = [0u8; MAX_PACKET_LEN];
-                    let (tcp_sock, _) = stack
-                        .connect(&mut buf, remote_addr, first_port as u32)
-                        .await?;
-                    Some(Arc::new(ClientTcpSocket::new(tcp_sock)))
+                    let (tcp_sock, _) = stack.connect(&mut buf, remote_addr, first_port as u32).await?;
+                    Some(Arc::new(ClientTcpSocket::new(index, tcp_sock)))
                 });
             }
+
             while let Some(tcp_sock) = set.join_next().await {
                 let tcp_sock = match tcp_sock {
                     Ok(tcp_sock) => match tcp_sock {
                         Some(tcp_sock) => tcp_sock,
                         None => {
                             error!(
-                                "Unable to connect a tcp sock to remote {remote_addr} for {addr}"
+                                "Unable to connect a standby tcp sock to remote {remote_addr} for {addr}"
                             );
                             cancellation.cancel();
                             continue 'main_loop;
@@ -826,19 +955,22 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
                     },
                     Err(err) => {
                         error!(
-                                "Unable to join a tcp sock connection to remote {remote_addr} for {addr}: {err}"
-                            );
+                            "Unable to join a standby tcp sock connection to remote {remote_addr} for {addr}: {err}"
+                        );
                         cancellation.cancel();
                         continue 'main_loop;
                     }
                 };
                 socks.push(tcp_sock);
             }
+
+            socks.sort_by_key(|sock| sock.index);
             Arc::new(socks)
         };
         let session_state = Arc::new(ClientSessionState::new(tcp_socks.len()));
+        let flow_state = Arc::new(ClientFlowPoolState::new(0));
 
-        for (index, tcp_sock) in tcp_socks.iter().enumerate() {
+        for tcp_sock in tcp_socks.iter() {
             let mut buf = [0u8; MAX_PACKET_LEN];
             let tcp_connect = TcpConnect {
                 udp_socks: udp_socks.clone(),
@@ -846,16 +978,73 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
                 packet_received_tx: packet_received_tx.clone(),
                 handshake_packet: handshake_packet.clone(),
                 cancellation: cancellation.clone(),
-                first_packet: if index == 0 {
-                    Some(buf_r[..size].into())
-                } else {
-                    None
-                },
+                first_packet: (tcp_sock.index == 0).then(|| buf_r[..size].into()),
                 session_state: session_state.clone(),
             };
             let tcp_sock = tcp_sock.clone();
+            let tcp_socks = tcp_socks.clone();
+            let flow_state = flow_state.clone();
+            let tcp_mode = tcp_mode;
             tokio::spawn(async move {
-                tcp_connect.handle(&mut buf, tcp_sock).await;
+                let session_state = tcp_connect.session_state.clone();
+                let udp_socks = tcp_connect.udp_socks.clone();
+                let udp_count = udp_socks.len();
+                match tcp_mode {
+                    TcpMode::Pool => {
+                        run_tcp_connect_loop(
+                            &tcp_connect,
+                            &*tcp_sock,
+                            &mut buf,
+                            |socket, buf, packet| Box::pin(async move { socket.socket.send(buf, packet).await }),
+                            |socket, buf, packet| Box::pin(async move { socket.socket.send(buf, packet).await }),
+                            |socket, buf| Box::pin(async move { socket.socket.recv(buf).await }),
+                            move |_, udp_index, payload| {
+                                let udp_socks = udp_socks.clone();
+                                Box::pin(async move {
+                                    udp_socks[udp_index]
+                                        .send(payload)
+                                        .await
+                                        .map(|_| ())
+                                        .map_err(|err| err.to_string())
+                                })
+                            },
+                            udp_count,
+                            move |socket, reason| {
+                                close_tcp_socket_and_failover(
+                                    socket,
+                                    &tcp_socks,
+                                    &session_state,
+                                    &flow_state,
+                                    reason,
+                                )
+                            },
+                        )
+                        .await;
+                    }
+                    TcpMode::Concurrent => {
+                        run_tcp_connect_loop(
+                            &tcp_connect,
+                            &*tcp_sock,
+                            &mut buf,
+                            |socket, buf, packet| Box::pin(async move { socket.socket.send(buf, packet).await }),
+                            |socket, buf, packet| Box::pin(async move { socket.socket.send(buf, packet).await }),
+                            |socket, buf| Box::pin(async move { socket.socket.recv(buf).await }),
+                            move |_, udp_index, payload| {
+                                let udp_socks = udp_socks.clone();
+                                Box::pin(async move {
+                                    udp_socks[udp_index]
+                                        .send(payload)
+                                        .await
+                                        .map(|_| ())
+                                        .map_err(|err| err.to_string())
+                                })
+                            },
+                            udp_count,
+                            move |socket, reason| close_tcp_socket(socket, &session_state, reason),
+                        )
+                        .await;
+                    }
+                }
             });
         }
 
@@ -867,6 +1056,8 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
             let encryption = encryption.clone();
             let tcp_socks = tcp_socks.clone();
             let session_state = session_state.clone();
+            let flow_state = flow_state.clone();
+            let tcp_mode = tcp_mode;
             tokio::spawn(async move {
                 let mut buf_udp = [0u8; MAX_PACKET_LEN];
                 let mut buf = [0u8; MAX_PACKET_LEN];
@@ -891,13 +1082,28 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
                             if let Some(ref enc) = *encryption {
                                 enc.encrypt(&mut buf_udp[..size]);
                             }
-                            if !send_on_live_tcp_socket(
-                                &tcp_socks,
-                                &session_state,
-                                &mut buf,
-                                &buf_udp[..size],
-                            )
-                            .await
+                            let sent = match tcp_mode {
+                                TcpMode::Pool => {
+                                    send_on_primary_tcp_socket(
+                                        &tcp_socks,
+                                        &session_state,
+                                        &flow_state,
+                                        &mut buf,
+                                        &buf_udp[..size],
+                                    )
+                                    .await
+                                }
+                                TcpMode::Concurrent => {
+                                    send_on_live_tcp_socket(
+                                        &tcp_socks,
+                                        &session_state,
+                                        &mut buf,
+                                        &buf_udp[..size],
+                                    )
+                                    .await
+                                }
+                            };
+                            if !sent
                             {
                                 debug!("No live TCP sub-connections remain on {:?}, closing connection", udp_sock);
                                 cancellation.cancel();

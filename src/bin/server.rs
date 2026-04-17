@@ -1,7 +1,6 @@
 use cfg_if::cfg_if;
 use clap::ArgMatches;
 use clap::{crate_version, Arg, ArgAction, Command};
-use fxhash::FxBuildHasher;
 use log::{debug, error, info};
 use std::collections::HashMap;
 use std::fs;
@@ -19,9 +18,9 @@ use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::net::UdpSocket;
-use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tonel::tcp::packet::MAX_PACKET_LEN;
 use tonel::tcp::Stack;
@@ -71,6 +70,313 @@ fn build_pfctl_nat_rules(
         ));
     }
     rules
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TcpMode {
+    Pool,
+    Concurrent,
+}
+
+fn parse_tcp_mode(value: &str) -> Result<TcpMode, &'static str> {
+    match value {
+        "pool" => Ok(TcpMode::Pool),
+        "concurrent" => Ok(TcpMode::Concurrent),
+        _ => Err("TCP mode should be either 'pool' or 'concurrent'"),
+    }
+}
+
+struct ServerTcpSocket {
+    addr: SocketAddr,
+    socket: Arc<tonel::tcp::Socket>,
+    alive: AtomicBool,
+}
+
+impl ServerTcpSocket {
+    fn new(socket: tonel::tcp::Socket) -> Self {
+        let addr = socket.remote_addr();
+        Self {
+            addr,
+            socket: Arc::new(socket),
+            alive: AtomicBool::new(true),
+        }
+    }
+
+    fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+
+    fn mark_dead(&self) -> bool {
+        self.alive.swap(false, Ordering::AcqRel)
+    }
+}
+
+struct ServerFlowState {
+    flow_key: SocketAddr,
+    mode: TcpMode,
+    udp_socks: Arc<Vec<Arc<UdpSocket>>>,
+    connections: Mutex<HashMap<SocketAddr, Arc<ServerTcpSocket>>>,
+    active_connection: Mutex<Option<SocketAddr>>,
+    next_udp_sock_index: AtomicUsize,
+    next_tcp_socket_index: AtomicUsize,
+    encryption: Arc<Option<Encryption>>,
+    cancellation: CancellationToken,
+}
+
+impl ServerFlowState {
+    fn new(
+        flow_key: SocketAddr,
+        mode: TcpMode,
+        udp_socks: Arc<Vec<Arc<UdpSocket>>>,
+        encryption: Arc<Option<Encryption>>,
+    ) -> Self {
+        Self {
+            flow_key,
+            mode,
+            udp_socks,
+            connections: Mutex::new(HashMap::new()),
+            active_connection: Mutex::new(None),
+            next_udp_sock_index: AtomicUsize::new(0),
+            next_tcp_socket_index: AtomicUsize::new(0),
+            encryption,
+            cancellation: CancellationToken::new(),
+        }
+    }
+
+    fn add_connection(&self, conn: Arc<ServerTcpSocket>) {
+        if let Ok(mut connections) = self.connections.lock() {
+            connections.insert(conn.addr, conn.clone());
+        }
+        if let Ok(mut active_connection) = self.active_connection.lock() {
+            active_connection.get_or_insert(conn.addr);
+        }
+    }
+
+    fn mark_connection_dead(&self, addr: SocketAddr, reason: &str) -> usize {
+        let newly_closed = if let Ok(connections) = self.connections.lock() {
+            connections
+                .get(&addr)
+                .map(|conn| conn.mark_dead())
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        if newly_closed {
+            info!(
+                "TCP sub-connection {} closed for flow {}: {}",
+                addr, self.flow_key, reason
+            );
+        }
+
+        let mut next_active = None;
+        let remaining = if let Ok(mut connections) = self.connections.lock() {
+            connections.retain(|_, conn| conn.is_alive());
+            next_active = connections.keys().next().copied();
+            connections.len()
+        } else {
+            0
+        };
+
+        if let Ok(mut active_connection) = self.active_connection.lock() {
+            if remaining == 0 {
+                *active_connection = None;
+            } else if active_connection.as_ref().map(|active| *active == addr).unwrap_or(false) {
+                *active_connection = next_active;
+            }
+        }
+
+        if remaining == 0 {
+            self.cancellation.cancel();
+        }
+
+        remaining
+    }
+
+    fn note_client_activity(&self, addr: SocketAddr) {
+        if let Ok(mut active_connection) = self.active_connection.lock() {
+            *active_connection = Some(addr);
+        }
+    }
+
+    async fn forward_tcp_payload_to_udp(&self, addr: SocketAddr, payload: &[u8]) -> Result<(), String> {
+        self.note_client_activity(addr);
+        let index = self.next_udp_sock_index.fetch_add(1, Ordering::Relaxed) % self.udp_socks.len();
+        self.udp_socks[index]
+            .send(payload)
+            .await
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    }
+
+    fn select_active_connection(&self) -> Option<Arc<ServerTcpSocket>> {
+        let active_addr = self
+            .active_connection
+            .lock()
+            .ok()
+            .and_then(|active_connection| *active_connection);
+
+        let connections = self.connections.lock().ok()?;
+
+        if let Some(active_addr) = active_addr {
+            if let Some(conn) = connections.get(&active_addr) {
+                if conn.is_alive() {
+                    return Some(conn.clone());
+                }
+            }
+        }
+
+        connections.values().find(|conn| conn.is_alive()).cloned()
+    }
+
+    fn select_concurrent_connection(&self) -> Option<Arc<ServerTcpSocket>> {
+        let connections = self.connections.lock().ok()?;
+        let mut live: Vec<_> = connections
+            .values()
+            .filter(|conn| conn.is_alive())
+            .cloned()
+            .collect();
+        drop(connections);
+        if live.is_empty() {
+            return None;
+        }
+        live.sort_by_key(|conn| conn.addr);
+        let index = self
+            .next_tcp_socket_index
+            .fetch_add(1, Ordering::Relaxed)
+            % live.len();
+        Some(live[index].clone())
+    }
+
+    fn select_connection_for_send(&self) -> Option<Arc<ServerTcpSocket>> {
+        match self.mode {
+            TcpMode::Pool => self.select_active_connection(),
+            TcpMode::Concurrent => self.select_concurrent_connection(),
+        }
+    }
+
+    async fn forward_udp_payload_to_tcp(&self, payload: &[u8]) -> io::Result<()> {
+        let mut encrypted = payload.to_vec();
+        if let Some(enc) = self.encryption.as_ref() {
+            enc.encrypt(&mut encrypted);
+        }
+
+        loop {
+            let conn = self.select_connection_for_send().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "no active tcp connection for flow")
+            })?;
+            let mut buf = [0u8; MAX_PACKET_LEN];
+            if conn.socket.send(&mut buf, &encrypted).await.is_some() {
+                if self.mode == TcpMode::Pool {
+                    self.note_client_activity(conn.addr);
+                }
+                return Ok(());
+            }
+
+            if self.mark_connection_dead(conn.addr, "send failure while forwarding UDP payload")
+                == 0
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "no live tcp connection remains for flow",
+                ));
+            }
+        }
+    }
+}
+
+async fn create_remote_udp_socks(
+    remote_addr: SocketAddr,
+    count: usize,
+) -> io::Result<Arc<Vec<Arc<UdpSocket>>>> {
+    let udp_sock = UdpSocket::bind(if remote_addr.is_ipv4() {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+    } else {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+    })
+    .await?;
+    let local_addr = udp_sock.local_addr()?;
+    drop(udp_sock);
+
+    let mut socks = Vec::with_capacity(count.max(1));
+    for _ in 0..count.max(1) {
+        let udp_sock = new_udp_reuseport(local_addr)?;
+        udp_sock.connect(remote_addr).await?;
+        socks.push(Arc::new(udp_sock));
+    }
+    Ok(Arc::new(socks))
+}
+
+async fn run_server_udp_reader(flow: Arc<ServerFlowState>, udp_sock: Arc<UdpSocket>) {
+    let mut buf_udp = [0u8; MAX_PACKET_LEN];
+    loop {
+        tokio::select! {
+            biased;
+            _ = flow.cancellation.cancelled() => break,
+            res = udp_sock.recv(&mut buf_udp) => {
+                let size = match res {
+                    Ok(size) => size,
+                    Err(err) => {
+                        debug!("UDP connection error on {}: {err}", udp_sock.local_addr().unwrap());
+                        break;
+                    }
+                };
+                if let Err(err) = flow.forward_udp_payload_to_tcp(&buf_udp[..size]).await {
+                    debug!("Unable to send TCP packet for flow {}: {err}", flow.flow_key);
+                    if flow.cancellation.is_cancelled() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn run_server_tcp_loop(
+    flow: Arc<ServerFlowState>,
+    tcp_sock: Arc<ServerTcpSocket>,
+    handshake_packet: Arc<Option<Vec<u8>>>,
+    flow_remove_tx: kanal::AsyncSender<SocketAddr>,
+) {
+    let mut buf_tcp = [0u8; MAX_PACKET_LEN];
+    let mut should_receive_handshake_packet = handshake_packet.is_some();
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = flow.cancellation.cancelled() => break,
+            res = tcp_sock.socket.recv(&mut buf_tcp) => {
+                match res {
+                    Some(size) => {
+                        if should_receive_handshake_packet {
+                            should_receive_handshake_packet = false;
+                            if let Some(ref p) = *handshake_packet {
+                                let mut buf = [0u8; MAX_PACKET_LEN];
+                                if tcp_sock.socket.send(&mut buf, p).await.is_none() {
+                                    error!("Failed to send handshake packet to remote, closing connection.");
+                                    break;
+                                }
+                                debug!("Sent handshake packet to: {}", tcp_sock.socket);
+                            }
+                            continue;
+                        }
+                        if let Some(ref enc) = *flow.encryption {
+                            enc.decrypt(&mut buf_tcp[..size]);
+                        }
+                        if let Err(err) = flow.forward_tcp_payload_to_udp(tcp_sock.addr, &buf_tcp[..size]).await {
+                            debug!("Unable to send UDP packet to remote destination for flow {}: {err}", flow.flow_key);
+                            break;
+                        }
+                    },
+                    None => break,
+                }
+            }
+        }
+    }
+
+    if flow.mark_connection_dead(tcp_sock.addr, "recv returned EOF or forwarding failed") == 0 {
+        let _ = flow_remove_tx.send(flow.flow_key).await;
+    }
 }
 
 cfg_if! {
@@ -185,6 +491,14 @@ fn main() {
                 .help("Specify an encryption algorithm for using in TCP connections. \n\
                        Server and client should use the same encryption. \n\
                        Currently XOR is only supported and the format should be 'xor:key'.")
+        )
+        .arg(
+            Arg::new("tcp_mode")
+                .long("tcp-mode")
+                .required(false)
+                .value_name("mode")
+                .help("How grouped fakeTCP connections are used per UDP flow. 'pool' keeps one active plus hot standbys for failover. 'concurrent' stripes return traffic across live connections.")
+                .default_value("pool")
         )
         .arg(
             Arg::new("udp_connections")
@@ -328,6 +642,9 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
 
     info!("Remote address is: {}", remote_addr);
 
+    let tcp_mode = parse_tcp_mode(matches.get_one::<String>("tcp_mode").unwrap())
+        .expect("Invalid tcp mode");
+
     let udp_socks_amount =
         parse_udp_connections(matches.get_one::<String>("udp_connections").unwrap()).unwrap();
 
@@ -452,196 +769,75 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
     stack.listen(local_port);
     info!("Listening on {}", local_port);
 
-    struct TcpPeer {
-        udp_peers: Arc<Vec<Arc<UdpSocket>>>,
-    }
-    let mut addresses: HashMap<SocketAddr, TcpPeer, FxBuildHasher> = HashMap::default();
-    let (addresses_tx, addresses_rx) = kanal::unbounded_async::<SocketAddr>();
+    let mut flows: HashMap<SocketAddr, Arc<ServerFlowState>> = HashMap::new();
+    let (flow_remove_tx, mut flow_remove_rx) = kanal::bounded_async::<SocketAddr>(128);
+
     'main_loop: loop {
         let (tcp_sock, first_port) = tokio::select! {
             biased;
-            addr = addresses_rx.recv() => {
-                let addr = addr.unwrap();
-                addresses.remove(&addr);
-                continue;
+            flow_key = flow_remove_rx.recv() => {
+                match flow_key {
+                    Ok(flow_key) => {
+                        flows.remove(&flow_key);
+                        continue;
+                    }
+                    Err(err) => {
+                        error!("flow_remove_rx recv error: {err}");
+                        continue;
+                    }
+                }
             },
-            res = stack.accept() => {
-                res
-            },
+            accepted = stack.accept() => accepted,
         };
 
-        let tcp_sock = Arc::new(tcp_sock);
-        info!("New connection: {}", tcp_sock);
+        let flow_key = if first_port == 0 {
+            tcp_sock.remote_addr()
+        } else {
+            SocketAddr::new(tcp_sock.remote_addr().ip(), first_port)
+        };
+        let flow = if let Some(flow) = flows.get(&flow_key) {
+            flow.clone()
+        } else {
+            if first_port != 0 {
+                error!("The request pool key {flow_key} does not exist.");
+                continue;
+            }
 
-        let mut buf_tcp = [0u8; MAX_PACKET_LEN];
-
-        let mut should_receive_handshake_packet = false;
-        let handshake_packet = handshake_packet.clone();
-        if handshake_packet.is_some() {
-            should_receive_handshake_packet = true;
-        }
-
-        let mut removable_address: Option<SocketAddr> = None;
-
-        let udp_socks = if first_port == 0 {
-            let udp_sock = UdpSocket::bind(if remote_addr.is_ipv4() {
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0)
-            } else {
-                SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0)), 0)
-            })
-            .await;
-
-            let udp_sock = match udp_sock {
-                Ok(udp_sock) => udp_sock,
+            let udp_socks = match create_remote_udp_socks(remote_addr, udp_socks_amount).await {
+                Ok(udp_socks) => udp_socks,
                 Err(err) => {
-                    error!("No more UDP address is available: {err}");
+                    error!("Unable to create udp socket pool for flow {flow_key}: {err}");
                     continue;
                 }
             };
-
-            let local_addr = udp_sock.local_addr().unwrap();
-            drop(udp_sock);
-
-            let udp_socks: Vec<_> = {
-                let mut socks = Vec::with_capacity(udp_socks_amount);
-                for _ in 0..udp_socks_amount {
-                    let udp_sock = match new_udp_reuseport(local_addr) {
-                        Ok(udp_sock) => udp_sock,
-                        Err(err) => {
-                            error!("Craeting new udp socket error: {err}");
-                            continue 'main_loop;
-                        }
-                    };
-                    if let Err(err) = udp_sock.connect(remote_addr).await {
-                        error!("UDP couldn't connect to {remote_addr}: {err}, closing connection");
-                        continue 'main_loop;
-                    }
-                    socks.push(Arc::new(udp_sock));
-                }
-                socks
-            };
-
-            let udp_socks = Arc::new(udp_socks);
-
-            removable_address = Some(tcp_sock.remote_addr());
-
-            let tcp_peer = TcpPeer {
-                udp_peers: udp_socks.clone(),
-            };
-
-            addresses.insert(tcp_sock.remote_addr(), tcp_peer);
-
-            udp_socks
-        } else {
-            let address = SocketAddr::new(tcp_sock.remote_addr().ip(), first_port);
-            if let Some(tcp_peer) = addresses.get(&address) {
-                tcp_peer.udp_peers.clone()
-            } else {
-                error!("The request port {first_port} does not exists.");
-                continue;
+            let flow = Arc::new(ServerFlowState::new(
+                flow_key,
+                tcp_mode,
+                udp_socks.clone(),
+                encryption.clone(),
+            ));
+            for udp_sock in udp_socks.iter() {
+                let flow = flow.clone();
+                let udp_sock = udp_sock.clone();
+                tokio::spawn(async move {
+                    run_server_udp_reader(flow, udp_sock).await;
+                });
             }
+            flows.insert(flow_key, flow.clone());
+            flow
         };
 
-        let cancellation = CancellationToken::new();
-        let (packet_received_tx, _packet_received_rx) = broadcast::channel(1);
+        let tcp_sock = Arc::new(ServerTcpSocket::new(tcp_sock));
+        info!(
+            "New connection {} joined flow {}",
+            tcp_sock.socket, flow_key
+        );
+        flow.add_connection(tcp_sock.clone());
 
-        for udp_sock in udp_socks.as_ref() {
-            let tcp_sock = tcp_sock.clone();
-            let cancellation = cancellation.clone();
-            let encryption = encryption.clone();
-            let mut packet_received_rx = packet_received_tx.subscribe();
-            let packet_received_tx = packet_received_tx.clone();
-            let udp_sock = udp_sock.clone();
-            tokio::spawn(async move {
-                let mut buf_udp = [0u8; MAX_PACKET_LEN];
-                let mut buf = [0u8; MAX_PACKET_LEN];
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = cancellation.cancelled() => {
-                            debug!("Closing connection requested for {}, closing connection", udp_sock.local_addr().unwrap());
-                            break;
-                        },
-                        res = udp_sock.recv(&mut buf_udp) => {
-                            match res {
-                                Ok(size) => {
-                                    if let Some(ref enc) = *encryption {
-                                        enc.encrypt(&mut buf_udp[..size]);
-                                    }
-                                    if tcp_sock.send(&mut buf, &buf_udp[..size]).await.is_none() {
-                                        debug!("Unable to send TCP packet to {remote_addr}, closing connection");
-                                        break;
-                                    }
-                                },
-                                Err(err) => {
-                                    debug!("UDP connection error on {}: {err}", udp_sock.local_addr().unwrap());
-                                    break;
-                                }
-                            };
-                        },
-                        _ = packet_received_rx.recv() => {
-                            continue;
-                        },
-                    };
-                    _ = packet_received_tx.send(());
-                }
-                debug!(
-                    "UDP connection closed on {}",
-                    udp_sock.local_addr().unwrap()
-                );
-                cancellation.cancel();
-            });
-        }
-        let tcp_sock = tcp_sock.clone();
-        let encryption = encryption.clone();
-        let cancellation = cancellation.clone();
-        let addresses_tx = addresses_tx.clone();
+        let flow_remove_tx = flow_remove_tx.clone();
+        let handshake_packet = handshake_packet.clone();
         tokio::spawn(async move {
-            let mut udp_sock_index = 0;
-            let mut buf = [0u8; MAX_PACKET_LEN];
-
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = cancellation.cancelled() => {
-                        debug!("Closing connection requested for {tcp_sock}, closing connection");
-                        break;
-                    },
-                    res = tcp_sock.recv(&mut buf_tcp) => {
-                        match res {
-                            Some(size) => {
-                                if should_receive_handshake_packet {
-                                    should_receive_handshake_packet = false;
-                                    if let Some(ref p) = *handshake_packet {
-                                        if tcp_sock.send(&mut buf, p).await.is_none() {
-                                            error!("Failed to send handshake packet to remote, closing connection.");
-                                            break;
-                                        }
-                                        debug!("Sent handshake packet to: {}", tcp_sock);
-                                    }
-                                    continue;
-                                }
-                                if let Some(ref enc) = *encryption {
-                                    enc.decrypt(&mut buf_tcp[..size]);
-                                }
-                                udp_sock_index = (udp_sock_index + 1) % udp_socks.len();
-                                if let Err(e) = udp_socks[udp_sock_index].send(&buf_tcp[..size]).await {
-                                    debug!("Unable to send UDP packet to {remote_addr}: {e}, closing connection");
-                                    break;
-                                }
-                            },
-                            None => {
-                                break;
-                            },
-                        };
-                    },
-                };
-                _ = packet_received_tx.send(());
-            }
-            if let Some(removable_address) = removable_address {
-                addresses_tx.send(removable_address).await.unwrap();
-            }
-            cancellation.cancel();
+            run_server_tcp_loop(flow, tcp_sock, handshake_packet, flow_remove_tx).await;
         });
     }
 }
