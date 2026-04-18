@@ -1,0 +1,20 @@
+[Unit]
+Description=Tonel Client
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=-/etc/default/tonelc
+ExecStart=/bin/sh -lc 'exec /usr/local/bin/tonelc $TONELC_ARGS'
+Restart=always
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=20
+StandardOutput=append:/var/log/tonelc.log
+StandardError=append:/var/log/tonelc.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,20 @@
+[Unit]
+Description=Tonel Server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=-/etc/default/tonels
+ExecStart=/bin/sh -lc 'exec /usr/local/bin/tonels $TONELS_ARGS'
+Restart=always
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=20
+StandardOutput=append:/var/log/tonels.log
+StandardError=append:/var/log/tonels.log
+
+[Install]
+WantedBy=multi-user.target

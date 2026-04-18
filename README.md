@@ -86,6 +86,41 @@ sudo setcap cap_net_admin=+pe tonelc
 sudo tonelc --local 127.0.0.1:1111 --remote 127.0.0.1:2222 --auto-rule eth0
 ```
 
+### systemd
+
+For Linux client deployments, a reusable systemd unit and environment file example are available under
+`deploy/systemd/tonelc.service` and `deploy/systemd/tonelc.env.example`.
+Install them as:
+
+```bash
+sudo install -m 0644 deploy/systemd/tonelc.service /etc/systemd/system/tonelc.service
+sudo install -m 0644 deploy/systemd/tonelc.env.example /etc/default/tonelc
+sudo systemctl daemon-reload
+sudo systemctl enable --now tonelc
+```
+
+The service uses `KillSignal=SIGINT` so Tonel's existing cleanup path can remove the auto-added
+iptables rules when the service stops.
+
+### Local Docker service
+
+For local development on machines where installing a root-owned `tonelc` binary is inconvenient,
+a user-level systemd unit is available under `deploy/systemd/tonelc-docker.service` with its
+environment example `deploy/systemd/tonelc-docker.env.example`.
+
+Install it as:
+
+```bash
+mkdir -p ~/.config/systemd/user
+install -m 0644 deploy/systemd/tonelc-docker.service ~/.config/systemd/user/tonelc-docker.service
+install -m 0644 deploy/systemd/tonelc-docker.env.example ~/.config/tonelc-docker.env
+systemctl --user daemon-reload
+systemctl --user enable --now tonelc-docker.service
+```
+
+This unit runs `tonelc` inside a privileged host-network Docker container and is intended for
+local validation against a remote `tonels` deployment.
+
 ## Server
 
 First, install the Tonel server or use the latest prebuild binaries from [Releases](https://github.com/sabify/tonel/releases/latest):
@@ -105,6 +140,22 @@ sudo setcap cap_net_admin=+pe tonels
 
 sudo tonels --local 2222 --remote 127.0.0.1:3333 --auto-rule eth0
 ```
+
+### systemd
+
+For Linux deployments, a reusable systemd unit and environment file example are available under
+`deploy/systemd/tonels.service` and `deploy/systemd/tonels.env.example`.
+Install them as:
+
+```bash
+sudo install -m 0644 deploy/systemd/tonels.service /etc/systemd/system/tonels.service
+sudo install -m 0644 deploy/systemd/tonels.env.example /etc/default/tonels
+sudo systemctl daemon-reload
+sudo systemctl enable --now tonels
+```
+
+The service uses `KillSignal=SIGINT` so Tonel's existing cleanup path can remove the auto-added
+iptables rules when the service stops.
 
 # MTU overhead
 
