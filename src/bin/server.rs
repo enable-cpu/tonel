@@ -55,6 +55,16 @@ fn format_linux_nat_rule(
     )
 }
 
+#[cfg(any(test, target_os = "linux"))]
+fn format_linux_forward_rule(
+    input_if: &str,
+    output_if: &str,
+    insert: bool,
+) -> String {
+    let action = if insert { "-I FORWARD" } else { "-D FORWARD" };
+    format!("{action} -i {input_if} -o {output_if} -j ACCEPT")
+}
+
 #[cfg(any(test, target_os = "macos"))]
 fn build_pfctl_nat_rules(
     int_name: &str,
@@ -72,24 +82,11 @@ fn build_pfctl_nat_rules(
     rules
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TcpMode {
-    Pool,
-    Concurrent,
-}
-
-fn parse_tcp_mode(value: &str) -> Result<TcpMode, &'static str> {
-    match value {
-        "pool" => Ok(TcpMode::Pool),
-        "concurrent" => Ok(TcpMode::Concurrent),
-        _ => Err("TCP mode should be either 'pool' or 'concurrent'"),
-    }
-}
-
 struct ServerTcpSocket {
     addr: SocketAddr,
     socket: Arc<tonel::tcp::Socket>,
     alive: AtomicBool,
+    has_payload_activity: AtomicBool,
 }
 
 impl ServerTcpSocket {
@@ -99,6 +96,7 @@ impl ServerTcpSocket {
             addr,
             socket: Arc::new(socket),
             alive: AtomicBool::new(true),
+            has_payload_activity: AtomicBool::new(false),
         }
     }
 
@@ -109,14 +107,20 @@ impl ServerTcpSocket {
     fn mark_dead(&self) -> bool {
         self.alive.swap(false, Ordering::AcqRel)
     }
+
+    fn note_payload_activity(&self) {
+        self.has_payload_activity.store(true, Ordering::Release);
+    }
+
+    fn has_payload_activity(&self) -> bool {
+        self.has_payload_activity.load(Ordering::Acquire)
+    }
 }
 
 struct ServerFlowState {
     flow_key: SocketAddr,
-    mode: TcpMode,
     udp_socks: Arc<Vec<Arc<UdpSocket>>>,
     connections: Mutex<HashMap<SocketAddr, Arc<ServerTcpSocket>>>,
-    active_connection: Mutex<Option<SocketAddr>>,
     next_udp_sock_index: AtomicUsize,
     next_tcp_socket_index: AtomicUsize,
     encryption: Arc<Option<Encryption>>,
@@ -126,16 +130,13 @@ struct ServerFlowState {
 impl ServerFlowState {
     fn new(
         flow_key: SocketAddr,
-        mode: TcpMode,
         udp_socks: Arc<Vec<Arc<UdpSocket>>>,
         encryption: Arc<Option<Encryption>>,
     ) -> Self {
         Self {
             flow_key,
-            mode,
             udp_socks,
             connections: Mutex::new(HashMap::new()),
-            active_connection: Mutex::new(None),
             next_udp_sock_index: AtomicUsize::new(0),
             next_tcp_socket_index: AtomicUsize::new(0),
             encryption,
@@ -146,9 +147,6 @@ impl ServerFlowState {
     fn add_connection(&self, conn: Arc<ServerTcpSocket>) {
         if let Ok(mut connections) = self.connections.lock() {
             connections.insert(conn.addr, conn.clone());
-        }
-        if let Ok(mut active_connection) = self.active_connection.lock() {
-            active_connection.get_or_insert(conn.addr);
         }
     }
 
@@ -169,22 +167,12 @@ impl ServerFlowState {
             );
         }
 
-        let mut next_active = None;
         let remaining = if let Ok(mut connections) = self.connections.lock() {
             connections.retain(|_, conn| conn.is_alive());
-            next_active = connections.keys().next().copied();
             connections.len()
         } else {
             0
         };
-
-        if let Ok(mut active_connection) = self.active_connection.lock() {
-            if remaining == 0 {
-                *active_connection = None;
-            } else if active_connection.as_ref().map(|active| *active == addr).unwrap_or(false) {
-                *active_connection = next_active;
-            }
-        }
 
         if remaining == 0 {
             self.cancellation.cancel();
@@ -193,14 +181,12 @@ impl ServerFlowState {
         remaining
     }
 
-    fn note_client_activity(&self, addr: SocketAddr) {
-        if let Ok(mut active_connection) = self.active_connection.lock() {
-            *active_connection = Some(addr);
-        }
-    }
-
     async fn forward_tcp_payload_to_udp(&self, addr: SocketAddr, payload: &[u8]) -> Result<(), String> {
-        self.note_client_activity(addr);
+        if let Ok(connections) = self.connections.lock() {
+            if let Some(conn) = connections.get(&addr) {
+                conn.note_payload_activity();
+            }
+        }
         let index = self.next_udp_sock_index.fetch_add(1, Ordering::Relaxed) % self.udp_socks.len();
         self.udp_socks[index]
             .send(payload)
@@ -209,33 +195,20 @@ impl ServerFlowState {
             .map_err(|err| err.to_string())
     }
 
-    fn select_active_connection(&self) -> Option<Arc<ServerTcpSocket>> {
-        let active_addr = self
-            .active_connection
-            .lock()
-            .ok()
-            .and_then(|active_connection| *active_connection);
-
-        let connections = self.connections.lock().ok()?;
-
-        if let Some(active_addr) = active_addr {
-            if let Some(conn) = connections.get(&active_addr) {
-                if conn.is_alive() {
-                    return Some(conn.clone());
-                }
-            }
-        }
-
-        connections.values().find(|conn| conn.is_alive()).cloned()
-    }
-
     fn select_concurrent_connection(&self) -> Option<Arc<ServerTcpSocket>> {
         let connections = self.connections.lock().ok()?;
         let mut live: Vec<_> = connections
             .values()
-            .filter(|conn| conn.is_alive())
+            .filter(|conn| conn.is_alive() && conn.has_payload_activity())
             .cloned()
             .collect();
+        if live.is_empty() {
+            live = connections
+                .values()
+                .filter(|conn| conn.is_alive())
+                .cloned()
+                .collect();
+        }
         drop(connections);
         if live.is_empty() {
             return None;
@@ -248,28 +221,20 @@ impl ServerFlowState {
         Some(live[index].clone())
     }
 
-    fn select_connection_for_send(&self) -> Option<Arc<ServerTcpSocket>> {
-        match self.mode {
-            TcpMode::Pool => self.select_active_connection(),
-            TcpMode::Concurrent => self.select_concurrent_connection(),
-        }
-    }
-
     async fn forward_udp_payload_to_tcp(&self, payload: &[u8]) -> io::Result<()> {
-        let mut encrypted = payload.to_vec();
-        if let Some(enc) = self.encryption.as_ref() {
-            enc.encrypt(&mut encrypted);
-        }
-
         loop {
-            let conn = self.select_connection_for_send().ok_or_else(|| {
+            let conn = self.select_concurrent_connection().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotConnected, "no active tcp connection for flow")
             })?;
             let mut buf = [0u8; MAX_PACKET_LEN];
-            if conn.socket.send(&mut buf, &encrypted).await.is_some() {
-                if self.mode == TcpMode::Pool {
-                    self.note_client_activity(conn.addr);
-                }
+            let sent = if let Some(enc) = self.encryption.as_ref() {
+                let mut encrypted = payload.to_vec();
+                enc.encrypt(&mut encrypted);
+                conn.socket.send(&mut buf, &encrypted).await.is_some()
+            } else {
+                conn.socket.send(&mut buf, payload).await.is_some()
+            };
+            if sent {
                 return Ok(());
             }
 
@@ -307,7 +272,11 @@ async fn create_remote_udp_socks(
     Ok(Arc::new(socks))
 }
 
-async fn run_server_udp_reader(flow: Arc<ServerFlowState>, udp_sock: Arc<UdpSocket>) {
+async fn run_server_udp_reader(
+    flow: Arc<ServerFlowState>,
+    udp_sock: Arc<UdpSocket>,
+    flow_remove_tx: kanal::AsyncSender<SocketAddr>,
+) {
     let mut buf_udp = [0u8; MAX_PACKET_LEN];
     loop {
         tokio::select! {
@@ -318,6 +287,8 @@ async fn run_server_udp_reader(flow: Arc<ServerFlowState>, udp_sock: Arc<UdpSock
                     Ok(size) => size,
                     Err(err) => {
                         debug!("UDP connection error on {}: {err}", udp_sock.local_addr().unwrap());
+                        flow.cancellation.cancel();
+                        let _ = flow_remove_tx.send(flow.flow_key).await;
                         break;
                     }
                 };
@@ -493,14 +464,6 @@ fn main() {
                        Currently XOR is only supported and the format should be 'xor:key'.")
         )
         .arg(
-            Arg::new("tcp_mode")
-                .long("tcp-mode")
-                .required(false)
-                .value_name("mode")
-                .help("How grouped fakeTCP connections are used per UDP flow. 'pool' keeps one active plus hot standbys for failover. 'concurrent' stripes return traffic across live connections.")
-                .default_value("pool")
-        )
-        .arg(
             Arg::new("udp_connections")
                 .long("udp-connections")
                 .required(false)
@@ -642,9 +605,6 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
 
     info!("Remote address is: {}", remote_addr);
 
-    let tcp_mode = parse_tcp_mode(matches.get_one::<String>("tcp_mode").unwrap())
-        .expect("Invalid tcp mode");
-
     let udp_socks_amount =
         parse_udp_connections(matches.get_one::<String>("udp_connections").unwrap()).unwrap();
 
@@ -708,6 +668,7 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
         cfg_if! {
             if #[cfg(target_os = "linux")] {
                 auto_rule(
+                    tun.name(),
                     dev_name,
                     tun_peer,
                     tun_peer6,
@@ -770,9 +731,9 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
     info!("Listening on {}", local_port);
 
     let mut flows: HashMap<SocketAddr, Arc<ServerFlowState>> = HashMap::new();
-    let (flow_remove_tx, mut flow_remove_rx) = kanal::bounded_async::<SocketAddr>(128);
+    let (flow_remove_tx, flow_remove_rx) = kanal::bounded_async::<SocketAddr>(128);
 
-    'main_loop: loop {
+    loop {
         let (tcp_sock, first_port) = tokio::select! {
             biased;
             flow_key = flow_remove_rx.recv() => {
@@ -812,15 +773,15 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
             };
             let flow = Arc::new(ServerFlowState::new(
                 flow_key,
-                tcp_mode,
                 udp_socks.clone(),
                 encryption.clone(),
             ));
             for udp_sock in udp_socks.iter() {
                 let flow = flow.clone();
                 let udp_sock = udp_sock.clone();
+                let flow_remove_tx = flow_remove_tx.clone();
                 tokio::spawn(async move {
-                    run_server_udp_reader(flow, udp_sock).await;
+                    run_server_udp_reader(flow, udp_sock, flow_remove_tx).await;
                 });
             }
             flows.insert(flow_key, flow.clone());
@@ -877,6 +838,16 @@ mod tests {
     }
 
     #[test]
+    fn format_linux_forward_rule_switches_direction_and_action() {
+        let insert_rule = format_linux_forward_rule("eth0", "tun0", true);
+        let delete_rule = format_linux_forward_rule("eth0", "tun0", false);
+        assert!(insert_rule.contains("-I FORWARD"));
+        assert!(delete_rule.contains("-D FORWARD"));
+        assert!(insert_rule.contains("-i eth0"));
+        assert!(insert_rule.contains("-o tun0"));
+    }
+
+    #[test]
     fn build_pfctl_nat_rules_includes_ipv6_when_requested() {
         let rules = build_pfctl_nat_rules(
             "en1",
@@ -891,6 +862,7 @@ mod tests {
 
 #[cfg(target_os = "linux")]
 fn auto_rule(
+    tun_name: &str,
     dev_name: &str,
     peer: Ipv4Addr,
     peer6: Option<Ipv6Addr>,
@@ -963,6 +935,10 @@ fn auto_rule(
 
     let iptables_add_rule = format_linux_nat_rule(dev_name, local_port, &peer.to_string(), true);
     let iptables_del_rule = format_linux_nat_rule(dev_name, local_port, &peer.to_string(), false);
+    let iptables_add_forward_in_rule = format_linux_forward_rule(dev_name, tun_name, true);
+    let iptables_add_forward_out_rule = format_linux_forward_rule(tun_name, dev_name, true);
+    let iptables_del_forward_in_rule = format_linux_forward_rule(dev_name, tun_name, false);
+    let iptables_del_forward_out_rule = format_linux_forward_rule(tun_name, dev_name, false);
     let ip6_peer_string = peer6.as_ref().map(|peer6| peer6.to_string());
     let ip6tables_add_rule = ip6_peer_string
         .as_deref()
@@ -970,26 +946,42 @@ fn auto_rule(
     let ip6tables_del_rule = ip6_peer_string
         .as_deref()
         .map(|destination| format_linux_nat_rule(dev_name, local_port, destination, false));
+    let ip6tables_add_forward_in_rule = format_linux_forward_rule(dev_name, tun_name, true);
+    let ip6tables_add_forward_out_rule = format_linux_forward_rule(tun_name, dev_name, true);
+    let ip6tables_del_forward_in_rule = format_linux_forward_rule(dev_name, tun_name, false);
+    let ip6tables_del_forward_out_rule = format_linux_forward_rule(tun_name, dev_name, false);
 
-    let status = std::process::Command::new("iptables")
-        .args(iptables_add_rule.split(' '))
-        .output()
-        .expect("iptables could not be executed.")
-        .status;
-
-    if !status.success() {
-        panic!("{iptables_add_rule} could not be executed successfully: {status}.");
-    }
-
-    if let Some(rule) = &ip6tables_add_rule {
-        let status = std::process::Command::new("ip6tables")
+    for rule in [
+        iptables_add_rule.as_str(),
+        iptables_add_forward_in_rule.as_str(),
+        iptables_add_forward_out_rule.as_str(),
+    ] {
+        let status = std::process::Command::new("iptables")
             .args(rule.split(' '))
             .output()
-            .expect("ip6tables could not be executed.")
+            .expect("iptables could not be executed.")
             .status;
 
         if !status.success() {
             panic!("{rule} could not be executed successfully: {status}.");
+        }
+    }
+
+    if let Some(rule) = &ip6tables_add_rule {
+        for ip6rule in [
+            rule.as_str(),
+            ip6tables_add_forward_in_rule.as_str(),
+            ip6tables_add_forward_out_rule.as_str(),
+        ] {
+            let status = std::process::Command::new("ip6tables")
+                .args(ip6rule.split(' '))
+                .output()
+                .expect("ip6tables could not be executed.")
+                .status;
+
+            if !status.success() {
+                panic!("{ip6rule} could not be executed successfully: {status}.");
+            }
         }
     }
     Box::new(move || {
@@ -1031,27 +1023,39 @@ fn auto_rule(
             }
         }
 
-        let status = std::process::Command::new("iptables")
-            .args(iptables_del_rule.split(' '))
-            .output()
-            .expect("iptables could not be executed.")
-            .status;
+        for rule in [
+            iptables_del_rule.as_str(),
+            iptables_del_forward_in_rule.as_str(),
+            iptables_del_forward_out_rule.as_str(),
+        ] {
+            let status = std::process::Command::new("iptables")
+                .args(rule.split(' '))
+                .output()
+                .expect("iptables could not be executed.")
+                .status;
 
-        if !status.success() {
-            panic!("{iptables_del_rule} could not be executed successfully: {status}.");
+            if !status.success() {
+                panic!("{rule} could not be executed successfully: {status}.");
+            }
         }
 
         info!("Respective iptables rules removed.");
 
         if let Some(rule) = ip6tables_del_rule.as_ref() {
-            let status = std::process::Command::new("ip6tables")
-                .args(rule.split(' '))
-                .output()
-                .expect("ip6tables could not be executed.")
-                .status;
+            for ip6rule in [
+                rule.as_str(),
+                ip6tables_del_forward_in_rule.as_str(),
+                ip6tables_del_forward_out_rule.as_str(),
+            ] {
+                let status = std::process::Command::new("ip6tables")
+                    .args(ip6rule.split(' '))
+                    .output()
+                    .expect("ip6tables could not be executed.")
+                    .status;
 
-            if !status.success() {
-                panic!("{rule} could not be executed successfully: {status}.");
+                if !status.success() {
+                    panic!("{ip6rule} could not be executed successfully: {status}.");
+                }
             }
         }
 

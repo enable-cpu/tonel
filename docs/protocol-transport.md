@@ -23,23 +23,14 @@ on the fake TCP transport and decrypted after they are received.
 
 ## Flow Binding
 
-Each incoming UDP flow can maintain a small fakeTCP connection pool, and the behavior of that
-pool is selected by `--tcp-mode`.
+Each incoming UDP flow maintains two fakeTCP pools:
 
-### `pool` mode
-
-- One fakeTCP connection is active for payload delivery.
-- Additional fakeTCP connections stay established as hot standbys.
-- Tonel does not stripe one UDP flow across multiple fakeTCP connections at the same time.
-- If the active fakeTCP connection breaks, Tonel fails over the flow to another live connection in the pool.
-- Other UDP flows still keep their own independent pools and are not affected by a different flow's failure.
-
-### `concurrent` mode
-
-- All live fakeTCP connections in the pool participate in payload delivery.
-- Client-originated packets are striped across live fakeTCP connections.
-- Server-originated packets are also striped across live fakeTCP connections for the same flow.
-- If one fakeTCP connection breaks, the flow continues on the remaining live connections.
+- One concurrent pool is active for business traffic and a second pool is kept hot as standby.
+- Client-originated packets are striped across live fakeTCP connections in the active pool.
+- Server-originated packets are sent toward the connections that have recently carried business payloads.
+- If the active concurrent pool degrades or fails, Tonel switches the flow to the hot standby pool.
+- The previously active pool is then repaired in the background and becomes the new standby pool.
+- Close events are fed into a per-flow learner, which adjusts business send width and repair backoff.
 
 ## What Was Removed
 
@@ -58,12 +49,13 @@ Session association is again implicit in transport topology rather than explicit
 
 - A client UDP peer is represented by one UDP flow session with a fakeTCP pool.
 - The server groups accepted fakeTCP connections for the same UDP flow into one shared transport session.
-- In `pool` mode, the server sends return traffic on the currently active connection.
-- In `concurrent` mode, the server stripes return traffic across live connections in the same flow session.
+- The server prefers the connections that have recently carried business payloads, so the hot standby pool stays reserved until failover.
 - Payload routing depends on socket ownership and connection setup, not on a Tonel frame envelope.
 
-The `--tcp-connections` client option controls the size of this per-flow pool, and `--tcp-mode`
-controls whether the pool behaves as failover hot standbys or as concurrent transport channels.
+The `--tcp-connections` client option controls the size of each per-flow pool.
+
+On Linux, `--auto-rule` is expected to manage both NAT rules and the necessary `FORWARD`
+accept rules between the TUN interface and the selected physical interface.
 
 This keeps the wire format minimal and avoids adding a second protocol on top of hy2.
 

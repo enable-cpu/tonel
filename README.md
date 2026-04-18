@@ -43,9 +43,9 @@ Tonel is a tool that is often used in situations where UDP is restricted or slow
 
 Tonel now transports raw UDP payload bytes, such as hy2 packets, over its fake TCP sub-connections.
 It does not add a Tonel-level frame header, connection identifier, or extra wire metadata.
-Each incoming UDP flow can use one of two fakeTCP strategies selected by `--tcp-mode`:
-`pool` keeps one active connection plus hot standbys for failover, while `concurrent`
-stripes payloads across all live fakeTCP connections in the flow's pool.
+Each incoming UDP flow always starts with an active concurrent pool for business traffic and a
+second hot standby pool for fast failover. Tonel then learns from connection-close events and
+adjusts how aggressively it uses and repairs these pools.
 The current transport notes are documented in [docs/protocol-transport.md](docs/protocol-transport.md).
 
 # Usage
@@ -165,20 +165,19 @@ Options:
                                        first data packet to the server.
                                        Note: ensure this file's size does not exceed the MTU of the outgoing interface.
                                        The content is always sent out in a single packet and will not be further segmented
-      --tcp-connections <number>       The number of fakeTCP connections to maintain per UDP flow.
-                                       One is active and the rest stay as hot standbys for failover. [default: 1]
-      --tcp-mode <mode>                How fakeTCP connections are used per UDP flow.
-                                       'pool' keeps one active plus hot standbys for failover.
-                                       'concurrent' stripes payloads across live connections. [default: pool]
+      --tcp-connections <number>       The size of each per-flow fakeTCP pool.
+                                       Tonel starts one active concurrent pool and one hot standby pool. [default: 1]
       --udp-connections <number>       The number of UDP connections per each client. [default: 1]
       --tun-queues <number>            The number of queues for TUN interface. Default is
                                        set to 1. The platform should support multiple queues feature. [default: 1]
       --encryption <encryption>        Specify an encryption algorithm for using in TCP connections.
                                        Server and client should use the same encryption.
                                        Currently XOR is only supported and the format should be 'xor:key'.
-      --auto-rule <interface-name>     Automatically adds and removes required firewall and sysctl rules.
-                                       The argument needs the name of an active network interface
-                                       that the firewall will route the traffic over it. (e.g. eth0)
+     --auto-rule <interface-name>     Automatically adds and removes required firewall and sysctl rules.
+                                      The argument needs the name of an active network interface
+                                      that the firewall will route the traffic over it. (e.g. eth0)
+                                      On Linux this now includes the required FORWARD accept rules
+                                      between the TUN device and the selected egress interface.
   -d, --daemonize                      Start the process as a daemon.
       --log-output <path>              Log output path. Default is stderr.
       --log-level <level>              Log output level. It could be one of the following:
@@ -217,9 +216,6 @@ Options:
                                        first data packet to the client.
                                        Note: ensure this file's size does not exceed the MTU of the outgoing interface.
                                        The content is always sent out in a single packet and will not be further segmented
-      --tcp-mode <mode>                How grouped fakeTCP connections are used per UDP flow.
-                                       'pool' keeps one active plus hot standbys for failover.
-                                       'concurrent' stripes return traffic across live connections. [default: pool]
       --encryption <encryption>        Specify an encryption algorithm for using in TCP connections.
                                        Server and client should use the same encryption.
                                        Currently XOR is only supported and the format should be 'xor:key'.
@@ -229,6 +225,8 @@ Options:
       --auto-rule <interface-name>     Automatically adds and removes required firewall and sysctl rules.
                                        The argument needs the name of an active network interface
                                        that the firewall will route the traffic over it. (e.g. eth0)
+                                       On Linux this now includes the required FORWARD accept rules
+                                       between the selected ingress interface and the TUN device.
   -d, --daemonize                      Start the process as a daemon.
       --log-output <log_output>        Log output path.
       --log-level <log_level>          Log output level. It could be one of the following:
