@@ -53,7 +53,7 @@ const TIMEOUT: time::Duration = time::Duration::from_secs(3);
 const MPMC_BUFFER_LEN: usize = 1024 * 64;
 const MPSC_BUFFER_LEN: usize = 1024 * 8;
 
-pub const MAX_FAKE_TCP_PAYLOAD_LEN: usize = 1280;
+pub const MAX_FAKE_TCP_PAYLOAD_LEN: usize = 1400;
 pub const LARGE_FAKE_TCP_PAYLOAD_WARN_LEN: usize = 1200;
 
 type SocketAsyncSender = kanal::AsyncSender<(
