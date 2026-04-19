@@ -188,6 +188,13 @@ impl ServerFlowState {
             }
         }
         let index = self.next_udp_sock_index.fetch_add(1, Ordering::Relaxed) % self.udp_socks.len();
+        debug!(
+            "Forwarding {} bytes from TCP flow {} on conn {} to UDP backend socket {}",
+            payload.len(),
+            self.flow_key,
+            addr,
+            index
+        );
         self.udp_socks[index]
             .send(payload)
             .await
@@ -235,6 +242,12 @@ impl ServerFlowState {
                 conn.socket.send(&mut buf, payload).await.is_some()
             };
             if sent {
+                debug!(
+                    "Forwarded {} bytes from UDP backend for flow {} onto TCP conn {}",
+                    payload.len(),
+                    self.flow_key,
+                    conn.addr
+                );
                 return Ok(());
             }
 

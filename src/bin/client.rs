@@ -914,6 +914,12 @@ async fn send_on_active_concurrent_pool(
                 let sent = tcp_sock.socket.send(buf, payload).await;
                 if sent.is_some() {
                     tcp_sock.note_payload_activity();
+                    debug!(
+                        "Forwarded {} bytes on active fakeTCP {} in pool {}",
+                        payload.len(),
+                        tcp_sock.index,
+                        tcp_sock.pool_id
+                    );
                 }
                 sent
             })
@@ -1363,19 +1369,19 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
             next_socket_index,
         ));
 
-        {
-            let active_pool = concurrent_state.snapshot_pool_sockets(0);
-            for tcp_sock in active_pool.iter() {
-                let mut buf = [0u8; MAX_PACKET_LEN];
-                let tcp_connect = TcpConnect {
+                {
+                    let active_pool = concurrent_state.snapshot_pool_sockets(0);
+                    for tcp_sock in active_pool.iter() {
+                        let mut buf = [0u8; MAX_PACKET_LEN];
+                        let tcp_connect = TcpConnect {
                     udp_socks: udp_socks.clone(),
-                    encryption: encryption.clone(),
-                    packet_received_tx: packet_received_tx.clone(),
-                    handshake_packet: handshake_packet.clone(),
-                    cancellation: cancellation.clone(),
-                    tcp_socket_cancellation: tcp_sock.cancellation.clone(),
-                    first_packet: (tcp_sock.index == 0).then(|| buf_r[..size].into()),
-                };
+                            encryption: encryption.clone(),
+                            packet_received_tx: packet_received_tx.clone(),
+                            handshake_packet: handshake_packet.clone(),
+                            cancellation: cancellation.clone(),
+                            tcp_socket_cancellation: tcp_sock.cancellation.clone(),
+                            first_packet: None,
+                        };
                 let tcp_sock = tcp_sock.clone();
                 let flow_state = concurrent_state.clone();
                 tokio::spawn(async move {
@@ -1413,11 +1419,32 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
             for tcp_sock in standby_pool.iter() {
                 concurrent_state.spawn_tcp_loop(tcp_sock.clone());
             }
-        }
+                }
 
-        tokio::spawn(run_concurrent_pool_maintainer(concurrent_state.clone()));
+                tokio::spawn(run_concurrent_pool_maintainer(concurrent_state.clone()));
 
-        for udp_sock in udp_socks.iter() {
+                let mut initial_send_buf = [0u8; MAX_PACKET_LEN];
+                if !send_on_active_concurrent_pool(
+                    &concurrent_state,
+                    &mut initial_send_buf,
+                    &buf_r[..size],
+                )
+                .await
+                {
+                    error!(
+                        "Unable to forward initial UDP payload for {addr} to remote {remote_addr}"
+                    );
+                    concurrent_state.cancellation.cancel();
+                    continue 'main_loop;
+                }
+                debug!(
+                    "Forwarded initial UDP payload of {} bytes for {} to remote {}",
+                    size,
+                    addr,
+                    remote_addr
+                );
+
+                for udp_sock in udp_socks.iter() {
             let udp_sock = udp_sock.clone();
             let mut packet_received_rx = packet_received_tx.subscribe();
             let packet_received_tx = packet_received_tx.clone();
