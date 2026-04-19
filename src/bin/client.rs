@@ -1,7 +1,7 @@
 use cfg_if::cfg_if;
 use clap::ArgMatches;
 use clap::{crate_version, Arg, ArgAction, Command};
-use log::{debug, error, info, trace};
+use log::{debug, error, info, trace, warn};
 use std::collections::VecDeque;
 use std::fmt;
 use std::fs;
@@ -27,7 +27,7 @@ use tokio::task::JoinSet;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 use tonel::tcp::packet::MAX_PACKET_LEN;
-use tonel::tcp::{Socket, Stack};
+use tonel::tcp::{Socket, Stack, LARGE_FAKE_TCP_PAYLOAD_WARN_LEN, MAX_FAKE_TCP_PAYLOAD_LEN};
 use tonel::utils::{assign_ipv6_address, new_udp_reuseport};
 use tonel::Encryption;
 use tun::Device;
@@ -357,6 +357,47 @@ fn ensure_linux_netfilter_tools(ipv6: bool) {
 
     if !command_exists("iptables") || (ipv6 && !command_exists("ip6tables")) {
         panic!("iptables tooling is still unavailable after automatic installation.");
+    }
+}
+
+fn log_client_outbound_udp_payload(size: usize, source: &SocketAddr, remote_addr: &SocketAddr) -> bool {
+    if size > MAX_FAKE_TCP_PAYLOAD_LEN {
+        warn!(
+            "Dropping outbound UDP payload of {} bytes from {} to remote {} because it exceeds the enforced fakeTCP clamp of {} bytes",
+            size,
+            source,
+            remote_addr,
+            MAX_FAKE_TCP_PAYLOAD_LEN
+        );
+        return true;
+    }
+    if size >= LARGE_FAKE_TCP_PAYLOAD_WARN_LEN {
+        warn!(
+            "Observed large outbound UDP payload of {} bytes from {} to remote {} (fakeTCP clamp {} bytes)",
+            size,
+            source,
+            remote_addr,
+            MAX_FAKE_TCP_PAYLOAD_LEN
+        );
+    }
+    false
+}
+
+fn log_client_inbound_fake_tcp_payload(size: usize, socket: &impl fmt::Display) {
+    if size > MAX_FAKE_TCP_PAYLOAD_LEN {
+        warn!(
+            "Received inbound fakeTCP payload of {} bytes on {} which exceeds the enforced clamp of {} bytes",
+            size,
+            socket,
+            MAX_FAKE_TCP_PAYLOAD_LEN
+        );
+    } else if size >= LARGE_FAKE_TCP_PAYLOAD_WARN_LEN {
+        warn!(
+            "Received large inbound fakeTCP payload of {} bytes on {} (fakeTCP clamp {} bytes)",
+            size,
+            socket,
+            MAX_FAKE_TCP_PAYLOAD_LEN
+        );
     }
 }
 
@@ -1116,6 +1157,7 @@ async fn run_tcp_connect_loop<S, H, F, R, U, C>(
                         if let Some(ref enc) = *connect.encryption {
                             enc.decrypt(&mut buf[..size]);
                         }
+                        log_client_inbound_fake_tcp_payload(size, tcp_sock);
                         udp_sock_index = (udp_sock_index + 1) % udp_rounds;
                         if let Err(err) = forward_udp(tcp_sock, udp_sock_index, &buf[..size]).await {
                             debug!(
@@ -1327,6 +1369,10 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
 
     'main_loop: loop {
         let (size, addr) = udp_sock.recv_from(&mut buf_r).await.unwrap();
+
+        if log_client_outbound_udp_payload(size, &addr, &remote_addr) {
+            continue;
+        }
 
         info!("New UDP client from {}", addr);
         let stack = stack.clone();
@@ -1567,6 +1613,12 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
                             break;
                         }
                         ClientUdpActivity::Received(size) => {
+                            let udp_source = udp_sock
+                                .peer_addr()
+                                .unwrap_or_else(|_| udp_sock.local_addr().unwrap());
+                            if log_client_outbound_udp_payload(size, &udp_source, &remote_addr) {
+                                continue;
+                            }
                             if let Some(ref enc) = *encryption {
                                 enc.encrypt(&mut buf_udp[..size]);
                             }

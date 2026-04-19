@@ -1,7 +1,7 @@
 use cfg_if::cfg_if;
 use clap::ArgMatches;
 use clap::{crate_version, Arg, ArgAction, Command};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 use tonel::tcp::packet::MAX_PACKET_LEN;
-use tonel::tcp::Stack;
+use tonel::tcp::{Stack, LARGE_FAKE_TCP_PAYLOAD_WARN_LEN, MAX_FAKE_TCP_PAYLOAD_LEN};
 use tonel::utils::{assign_ipv6_address, new_udp_reuseport};
 use tonel::Encryption;
 use tun::Device;
@@ -157,6 +157,47 @@ fn ensure_linux_netfilter_tools(ipv6: bool) {
 
     if !command_exists("iptables") || (ipv6 && !command_exists("ip6tables")) {
         panic!("iptables tooling is still unavailable after automatic installation.");
+    }
+}
+
+fn log_server_backend_udp_payload(size: usize, flow_key: &SocketAddr) -> bool {
+    if size > MAX_FAKE_TCP_PAYLOAD_LEN {
+        warn!(
+            "Dropping UDP backend payload of {} bytes for flow {} because it exceeds the enforced fakeTCP clamp of {} bytes",
+            size,
+            flow_key,
+            MAX_FAKE_TCP_PAYLOAD_LEN
+        );
+        return true;
+    }
+    if size >= LARGE_FAKE_TCP_PAYLOAD_WARN_LEN {
+        warn!(
+            "Observed large UDP backend payload of {} bytes for flow {} (fakeTCP clamp {} bytes)",
+            size,
+            flow_key,
+            MAX_FAKE_TCP_PAYLOAD_LEN
+        );
+    }
+    false
+}
+
+fn log_server_inbound_fake_tcp_payload(size: usize, flow_key: &SocketAddr, conn: &SocketAddr) {
+    if size > MAX_FAKE_TCP_PAYLOAD_LEN {
+        warn!(
+            "Received inbound fakeTCP payload of {} bytes on flow {} conn {} which exceeds the enforced clamp of {} bytes",
+            size,
+            flow_key,
+            conn,
+            MAX_FAKE_TCP_PAYLOAD_LEN
+        );
+    } else if size >= LARGE_FAKE_TCP_PAYLOAD_WARN_LEN {
+        warn!(
+            "Received large inbound fakeTCP payload of {} bytes on flow {} conn {} (fakeTCP clamp {} bytes)",
+            size,
+            flow_key,
+            conn,
+            MAX_FAKE_TCP_PAYLOAD_LEN
+        );
     }
 }
 
@@ -400,6 +441,9 @@ async fn run_server_udp_reader(
                         break;
                     }
                 };
+                if log_server_backend_udp_payload(size, &flow.flow_key) {
+                    continue;
+                }
                 if let Err(err) = flow.forward_udp_payload_to_tcp(&buf_udp[..size]).await {
                     debug!("Unable to send TCP packet for flow {}: {err}", flow.flow_key);
                     if flow.cancellation.is_cancelled() {
@@ -442,6 +486,7 @@ async fn run_server_tcp_loop(
                         if let Some(ref enc) = *flow.encryption {
                             enc.decrypt(&mut buf_tcp[..size]);
                         }
+                        log_server_inbound_fake_tcp_payload(size, &flow.flow_key, &tcp_sock.addr);
                         if let Err(err) = flow.forward_tcp_payload_to_udp(tcp_sock.addr, &buf_tcp[..size]).await {
                             debug!("Unable to send UDP packet to remote destination for flow {}: {err}", flow.flow_key);
                             break;

@@ -53,6 +53,9 @@ const TIMEOUT: time::Duration = time::Duration::from_secs(3);
 const MPMC_BUFFER_LEN: usize = 1024 * 64;
 const MPSC_BUFFER_LEN: usize = 1024 * 8;
 
+pub const MAX_FAKE_TCP_PAYLOAD_LEN: usize = 1280;
+pub const LARGE_FAKE_TCP_PAYLOAD_WARN_LEN: usize = 1200;
+
 type SocketAsyncSender = kanal::AsyncSender<(
     opool::RefGuard<'static, ObjectPoolAllocator, Box<[u8; MAX_PACKET_LEN]>>,
     usize,
@@ -238,6 +241,23 @@ impl Socket {
     pub async fn send(&self, buf: &mut [u8], payload: &[u8]) -> Option<()> {
         match self.state {
             State::Established => {
+                if payload.len() > MAX_FAKE_TCP_PAYLOAD_LEN {
+                    warn!(
+                        "Dropping fakeTCP payload of {} bytes on {} because it exceeds the enforced clamp of {} bytes",
+                        payload.len(),
+                        self,
+                        MAX_FAKE_TCP_PAYLOAD_LEN
+                    );
+                    return None;
+                }
+                if payload.len() >= LARGE_FAKE_TCP_PAYLOAD_WARN_LEN {
+                    debug!(
+                        "Sending large fakeTCP payload of {} bytes on {} (clamp {} bytes)",
+                        payload.len(),
+                        self,
+                        MAX_FAKE_TCP_PAYLOAD_LEN
+                    );
+                }
                 let seq = reserve_send_seq(&self.seq, payload.len());
                 let result =
                     self.build_tcp_packet_with_seq(buf, seq, tcp::TcpFlags::ACK, Some(payload));
@@ -350,6 +370,22 @@ impl Socket {
                         }
 
                         let payload = tcp_packet.payload();
+
+                        if payload.len() > MAX_FAKE_TCP_PAYLOAD_LEN {
+                            warn!(
+                                "Received fakeTCP payload of {} bytes on {} which exceeds the enforced clamp of {} bytes",
+                                payload.len(),
+                                self,
+                                MAX_FAKE_TCP_PAYLOAD_LEN
+                            );
+                        } else if payload.len() >= LARGE_FAKE_TCP_PAYLOAD_WARN_LEN {
+                            debug!(
+                                "Received large fakeTCP payload of {} bytes on {} (clamp {} bytes)",
+                                payload.len(),
+                                self,
+                                MAX_FAKE_TCP_PAYLOAD_LEN
+                            );
+                        }
 
                         let new_ack = tcp_packet.get_sequence().wrapping_add(payload.len() as u32);
                         self.ack.store(new_ack, Ordering::Relaxed);
