@@ -65,6 +65,101 @@ fn format_linux_forward_rule(
     format!("{action} -i {input_if} -o {output_if} -j ACCEPT")
 }
 
+#[cfg(any(test, target_os = "linux"))]
+const LINUX_TCP_MSS_CLAMP: usize = 1280;
+
+#[cfg(any(test, target_os = "linux"))]
+fn format_linux_mss_clamp_rule(input_if: &str, output_if: &str, insert: bool) -> String {
+    let action = if insert {
+        "-t mangle -I FORWARD"
+    } else {
+        "-t mangle -D FORWARD"
+    };
+    format!(
+        "{action} -i {input_if} -o {output_if} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {LINUX_TCP_MSS_CLAMP}"
+    )
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn build_netfilter_install_commands(manager: &str) -> Option<Vec<Vec<&'static str>>> {
+    match manager {
+        "apt-get" => Some(vec![
+            vec!["apt-get", "update"],
+            vec!["apt-get", "install", "-y", "iptables"],
+        ]),
+        "dnf" => Some(vec![vec!["dnf", "install", "-y", "iptables"]]),
+        "yum" => Some(vec![vec!["yum", "install", "-y", "iptables"]]),
+        "apk" => Some(vec![vec!["apk", "add", "--no-cache", "iptables"]]),
+        "pacman" => Some(vec![vec![
+            "pacman",
+            "-Sy",
+            "--noconfirm",
+            "--needed",
+            "iptables",
+        ]]),
+        "zypper" => Some(vec![vec![
+            "zypper",
+            "--non-interactive",
+            "install",
+            "iptables",
+        ]]),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn command_exists(name: &str) -> bool {
+    let path_iter = std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>());
+    path_iter
+        .chain(
+            ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"]
+                .iter()
+                .map(std::path::PathBuf::from),
+        )
+        .any(|dir| dir.join(name).exists())
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_linux_netfilter_tools(ipv6: bool) {
+    if command_exists("iptables") && (!ipv6 || command_exists("ip6tables")) {
+        return;
+    }
+
+    info!("iptables tooling not found, attempting automatic installation.");
+    let package_manager = ["apt-get", "dnf", "yum", "apk", "pacman", "zypper"]
+        .into_iter()
+        .find(|manager| command_exists(manager))
+        .unwrap_or_else(|| {
+            panic!(
+                "iptables/ip6tables is not installed and no supported package manager was found."
+            )
+        });
+
+    for command in build_netfilter_install_commands(package_manager).unwrap() {
+        let status = std::process::Command::new(command[0])
+            .args(&command[1..])
+            .status()
+            .unwrap_or_else(|err| {
+                panic!(
+                    "Unable to execute automatic netfilter install command {:?}: {err}.",
+                    command
+                )
+            });
+        if !status.success() {
+            panic!(
+                "Automatic netfilter install command {:?} failed with status {status}.",
+                command
+            );
+        }
+    }
+
+    if !command_exists("iptables") || (ipv6 && !command_exists("ip6tables")) {
+        panic!("iptables tooling is still unavailable after automatic installation.");
+    }
+}
+
 #[cfg(any(test, target_os = "macos"))]
 fn build_pfctl_nat_rules(
     int_name: &str,
@@ -861,6 +956,34 @@ mod tests {
     }
 
     #[test]
+    fn format_linux_mss_clamp_rule_switches_direction_action_and_value() {
+        let insert_rule = format_linux_mss_clamp_rule("eth0", "tun0", true);
+        let delete_rule = format_linux_mss_clamp_rule("eth0", "tun0", false);
+        assert!(insert_rule.contains("-t mangle -I FORWARD"));
+        assert!(delete_rule.contains("-t mangle -D FORWARD"));
+        assert!(insert_rule.contains("--tcp-flags SYN,RST SYN"));
+        assert!(insert_rule.contains("--set-mss 1280"));
+        assert!(insert_rule.contains("-i eth0"));
+        assert!(insert_rule.contains("-o tun0"));
+    }
+
+    #[test]
+    fn build_netfilter_install_commands_supports_known_package_managers() {
+        assert_eq!(
+            build_netfilter_install_commands("apt-get").unwrap(),
+            vec![
+                vec!["apt-get", "update"],
+                vec!["apt-get", "install", "-y", "iptables"]
+            ]
+        );
+        assert_eq!(
+            build_netfilter_install_commands("apk").unwrap(),
+            vec![vec!["apk", "add", "--no-cache", "iptables"]]
+        );
+        assert!(build_netfilter_install_commands("unknown").is_none());
+    }
+
+    #[test]
     fn build_pfctl_nat_rules_includes_ipv6_when_requested() {
         let rules = build_pfctl_nat_rules(
             "en1",
@@ -881,6 +1004,8 @@ fn auto_rule(
     peer6: Option<Ipv6Addr>,
     local_port: u16,
 ) -> Box<dyn Fn() + 'static + Send> {
+    ensure_linux_netfilter_tools(peer6.is_some());
+
     let ipv4_forward_value = std::process::Command::new("sysctl")
         .arg("net.ipv4.ip_forward")
         .output()
@@ -952,6 +1077,10 @@ fn auto_rule(
     let iptables_add_forward_out_rule = format_linux_forward_rule(tun_name, dev_name, true);
     let iptables_del_forward_in_rule = format_linux_forward_rule(dev_name, tun_name, false);
     let iptables_del_forward_out_rule = format_linux_forward_rule(tun_name, dev_name, false);
+    let iptables_add_mss_in_rule = format_linux_mss_clamp_rule(dev_name, tun_name, true);
+    let iptables_add_mss_out_rule = format_linux_mss_clamp_rule(tun_name, dev_name, true);
+    let iptables_del_mss_in_rule = format_linux_mss_clamp_rule(dev_name, tun_name, false);
+    let iptables_del_mss_out_rule = format_linux_mss_clamp_rule(tun_name, dev_name, false);
     let ip6_peer_string = peer6.as_ref().map(|peer6| peer6.to_string());
     let ip6tables_add_rule = ip6_peer_string
         .as_deref()
@@ -963,11 +1092,17 @@ fn auto_rule(
     let ip6tables_add_forward_out_rule = format_linux_forward_rule(tun_name, dev_name, true);
     let ip6tables_del_forward_in_rule = format_linux_forward_rule(dev_name, tun_name, false);
     let ip6tables_del_forward_out_rule = format_linux_forward_rule(tun_name, dev_name, false);
+    let ip6tables_add_mss_in_rule = format_linux_mss_clamp_rule(dev_name, tun_name, true);
+    let ip6tables_add_mss_out_rule = format_linux_mss_clamp_rule(tun_name, dev_name, true);
+    let ip6tables_del_mss_in_rule = format_linux_mss_clamp_rule(dev_name, tun_name, false);
+    let ip6tables_del_mss_out_rule = format_linux_mss_clamp_rule(tun_name, dev_name, false);
 
     for rule in [
         iptables_add_rule.as_str(),
         iptables_add_forward_in_rule.as_str(),
         iptables_add_forward_out_rule.as_str(),
+        iptables_add_mss_in_rule.as_str(),
+        iptables_add_mss_out_rule.as_str(),
     ] {
         let status = std::process::Command::new("iptables")
             .args(rule.split(' '))
@@ -985,6 +1120,8 @@ fn auto_rule(
             rule.as_str(),
             ip6tables_add_forward_in_rule.as_str(),
             ip6tables_add_forward_out_rule.as_str(),
+            ip6tables_add_mss_in_rule.as_str(),
+            ip6tables_add_mss_out_rule.as_str(),
         ] {
             let status = std::process::Command::new("ip6tables")
                 .args(ip6rule.split(' '))
@@ -1040,6 +1177,8 @@ fn auto_rule(
             iptables_del_rule.as_str(),
             iptables_del_forward_in_rule.as_str(),
             iptables_del_forward_out_rule.as_str(),
+            iptables_del_mss_in_rule.as_str(),
+            iptables_del_mss_out_rule.as_str(),
         ] {
             let status = std::process::Command::new("iptables")
                 .args(rule.split(' '))
@@ -1059,6 +1198,8 @@ fn auto_rule(
                 rule.as_str(),
                 ip6tables_del_forward_in_rule.as_str(),
                 ip6tables_del_forward_out_rule.as_str(),
+                ip6tables_del_mss_in_rule.as_str(),
+                ip6tables_del_mss_out_rule.as_str(),
             ] {
                 let status = std::process::Command::new("ip6tables")
                     .args(ip6rule.split(' '))
