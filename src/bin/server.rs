@@ -913,10 +913,12 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
             flow.clone()
         } else {
             if first_port != 0 {
-                error!("The request pool key {flow_key} does not exist.");
-                continue;
+                warn!(
+                    "Flow {} was not registered before pooled connection {} arrived; creating flow from the pooled connection.",
+                    flow_key,
+                    tcp_sock
+                );
             }
-
             let udp_socks = match create_remote_udp_socks(remote_addr, udp_socks_amount).await {
                 Ok(udp_socks) => udp_socks,
                 Err(err) => {

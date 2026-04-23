@@ -1466,19 +1466,17 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
                 Ok(tcp_sock) => match tcp_sock {
                     Some(tcp_sock) => tcp_sock,
                     None => {
-                        error!(
+                        warn!(
                             "Unable to connect a concurrent tcp sock to remote {remote_addr} for {addr}"
                         );
-                        cancellation.cancel();
-                        continue 'main_loop;
+                        continue;
                     }
                 },
                 Err(err) => {
-                    error!(
+                    warn!(
                         "Unable to join a concurrent tcp sock connection to remote {remote_addr} for {addr}: {err}"
                     );
-                    cancellation.cancel();
-                    continue 'main_loop;
+                    continue;
                 }
             };
             if pool_id == 0 {
@@ -1490,6 +1488,14 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
 
         active_pool.sort_by_key(|sock| sock.index);
         standby_pool.sort_by_key(|sock| sock.index);
+
+        if active_pool.is_empty() && standby_pool.is_empty() {
+            error!(
+                "No concurrent or standby tcp sockets could be established for {addr}, abandoning session"
+            );
+            cancellation.cancel();
+            continue 'main_loop;
+        }
 
         let session_state = Arc::new(ClientSessionState::new(
             active_pool.len() + standby_pool.len(),
