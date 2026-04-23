@@ -7,7 +7,7 @@ After=network-online.target
 Type=simple
 EnvironmentFile=-%h/.config/tonelc-docker.env
 ExecStartPre=-/usr/bin/docker rm -f tonelc-service
-ExecStart=/bin/sh -lc 'exec /usr/bin/docker run --rm --name tonelc-service --network host --privileged -e http_proxy=${PROXY_URL} -e https_proxy=${PROXY_URL} -v ${TONEL_WORKDIR}:/work -w /work tonel-e2e-local /bin/sh -lc "export PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$$PATH; cargo build --release --bin tonelc >/tmp/build.log 2>&1 && exec ./target/release/tonelc $$TONELC_ARGS"'
+ExecStart=/bin/sh -lc 'exec /usr/bin/docker run --rm --name tonelc-service --network host --privileged -e http_proxy=${PROXY_URL} -e https_proxy=${PROXY_URL} -v ${TONEL_WORKDIR}:/work -w /work ${TONEL_DOCKER_IMAGE:-tonel-e2e-local} /bin/sh -lc "export PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$$PATH; cargo build --release --bin tonelc >/tmp/build.log 2>&1 && exec ./target/release/tonelc $$TONELC_ARGS"'
 ExecStop=-/usr/bin/docker stop tonelc-service
 Restart=always
 RestartSec=3

@@ -108,9 +108,13 @@ For local development on machines where installing a root-owned `tonelc` binary 
 a user-level systemd unit is available under `deploy/systemd/tonelc-docker.service` with its
 environment example `deploy/systemd/tonelc-docker.env.example`.
 
+Full Docker deployment steps are documented in
+`docs/docker-deployment.md`.
+
 Install it as:
 
 ```bash
+docker build -t tonel-e2e-local -f tests/e2e/Dockerfile .
 mkdir -p ~/.config/systemd/user
 install -m 0644 deploy/systemd/tonelc-docker.service ~/.config/systemd/user/tonelc-docker.service
 install -m 0644 deploy/systemd/tonelc-docker.env.example ~/.config/tonelc-docker.env
