@@ -20,7 +20,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 use tokio::task::JoinSet;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
@@ -130,7 +130,7 @@ fn main() {
                 .long("tcp-connections")
                 .required(false)
                 .value_name("number")
-                .help("The size of each per-flow fakeTCP pool. Tonel starts one active concurrent pool and one hot standby pool.")
+                .help("The size of each per-flow fakeTCP pool. Tonel rotates aggressively across live fakeTCP connections and backfills failed ones.")
                 .default_value("1")
         )
         .arg(
@@ -479,6 +479,7 @@ struct ClientConcurrentFlowState {
     next_socket_index: AtomicUsize,
     pool_connect_key: u16,
     sockets: std::sync::Mutex<Vec<Arc<ClientTcpSocket>>>,
+    pool_wakeup: Notify,
     stack: Arc<Stack>,
     remote_addr: SocketAddr,
     udp_socks: Arc<Vec<Arc<UdpSocket>>>,
@@ -509,6 +510,7 @@ impl ClientConcurrentFlowState {
             next_socket_index: AtomicUsize::new(next_socket_index),
             pool_connect_key,
             sockets: std::sync::Mutex::new(sockets),
+            pool_wakeup: Notify::new(),
             stack,
             remote_addr,
             udp_socks,
@@ -532,6 +534,16 @@ impl ClientConcurrentFlowState {
             .lock()
             .map(|sockets| sockets.iter().filter(|sock| sock.is_alive()).count())
             .unwrap_or(0)
+    }
+
+    fn note_pool_pressure(&self) {
+        self.pool_wakeup.notify_waiters();
+    }
+
+    fn prune_dead_sockets(&self) {
+        if let Ok(mut sockets) = self.sockets.lock() {
+            sockets.retain(|sock| sock.is_alive());
+        }
     }
 
     fn next_socket_index(&self) -> usize {
@@ -602,20 +614,35 @@ impl ClientConcurrentFlowState {
             }
         };
 
+        if missing == 0 {
+            return;
+        }
+
+        let mut set = JoinSet::new();
         for _ in 0..missing {
-            match self.create_tcp_socket().await {
-                Ok(tcp_sock) => {
+            let state = self.clone();
+            set.spawn(async move { state.create_tcp_socket().await });
+        }
+
+        while let Some(result) = set.join_next().await {
+            match result {
+                Ok(Ok(tcp_sock)) => {
                     if let Ok(mut sockets) = self.sockets.lock() {
                         sockets.push(tcp_sock.clone());
                     }
                     self.spawn_tcp_loop(tcp_sock);
                 }
-                Err(err) => {
+                Ok(Err(err)) => {
                     debug!(
                         "Unable to replenish pooled tcp socket for {}: {err}",
                         self.remote_addr
                     );
-                    break;
+                }
+                Err(err) => {
+                    debug!(
+                        "Unable to join pooled tcp socket creation for {}: {err}",
+                        self.remote_addr
+                    );
                 }
             }
         }
@@ -624,9 +651,10 @@ impl ClientConcurrentFlowState {
 
 async fn run_concurrent_pool_maintainer(state: Arc<ClientConcurrentFlowState>) {
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        if state.cancellation.is_cancelled() {
-            break;
+        tokio::select! {
+            _ = state.cancellation.cancelled() => break,
+            _ = state.pool_wakeup.notified() => {}
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
         }
 
         if state.live_socket_count() == 0 && state.session_state.live_tcp_sockets() == 0 {
@@ -809,6 +837,9 @@ async fn send_on_active_concurrent_pool(
     let mut active_pool = state.snapshot_sockets();
     active_pool.retain(|sock| sock.is_alive());
     active_pool.sort_by_key(|sock| sock.index);
+    if active_pool.len() < state.desired_pool_size {
+        state.note_pool_pressure();
+    }
     send_on_live_tcp_socket_with_sender(
         &active_pool,
         &state.session_state,
@@ -843,6 +874,8 @@ fn close_tcp_socket_in_concurrent_mode(
         flow_state.cancellation.cancel();
         return 0;
     }
+    flow_state.prune_dead_sockets();
+    flow_state.note_pool_pressure();
     remaining
 }
 
