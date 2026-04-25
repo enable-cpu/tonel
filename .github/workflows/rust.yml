@@ -60,7 +60,7 @@ jobs:
       run: make e2e
     - name: Upload E2E Logs
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: e2e-logs
         path: target/e2e
