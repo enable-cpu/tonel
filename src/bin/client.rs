@@ -18,8 +18,7 @@ use std::io::Write;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
 use tokio::task::JoinSet;
@@ -417,7 +416,6 @@ enum TcpCloseReason {
     UdpForwardFailure,
     SessionCancellation,
     SocketRetire,
-    RepairConnectFailure,
 }
 
 impl TcpCloseReason {
@@ -430,15 +428,7 @@ impl TcpCloseReason {
             TcpCloseReason::UdpForwardFailure => "failed to forward TCP payload to UDP",
             TcpCloseReason::SessionCancellation => "session cancellation",
             TcpCloseReason::SocketRetire => "retiring old active concurrent pool during failover",
-            TcpCloseReason::RepairConnectFailure => "standby repair connect failure",
         }
-    }
-
-    fn is_learning_relevant(self) -> bool {
-        !matches!(
-            self,
-            TcpCloseReason::SessionCancellation | TcpCloseReason::SocketRetire
-        )
     }
 }
 
@@ -672,8 +662,6 @@ struct ClientTcpSocket {
     index: usize,
     pool_id: usize,
     cancellation: CancellationToken,
-    created_at: Instant,
-    had_payload_activity: AtomicBool,
     socket: Arc<Socket>,
     state: ClientTcpSocketState,
 }
@@ -684,8 +672,6 @@ impl ClientTcpSocket {
             index,
             pool_id,
             cancellation: CancellationToken::new(),
-            created_at: Instant::now(),
-            had_payload_activity: AtomicBool::new(false),
             socket: Arc::new(socket),
             state: ClientTcpSocketState::new(),
         }
@@ -693,14 +679,6 @@ impl ClientTcpSocket {
 
     fn is_alive(&self) -> bool {
         self.state.is_alive()
-    }
-
-    fn note_payload_activity(&self) {
-        self.had_payload_activity.store(true, Ordering::Release);
-    }
-
-    fn had_payload_activity(&self) -> bool {
-        self.had_payload_activity.load(Ordering::Acquire)
     }
 }
 
@@ -755,16 +733,6 @@ fn close_tcp_socket(
             tcp_sock.socket, reason.as_str(), remaining
         );
     }
-    remaining
-}
-
-fn retire_tcp_socket(
-    tcp_sock: &ClientTcpSocket,
-    session_state: &ClientSessionState,
-    reason: TcpCloseReason,
-) -> usize {
-    let remaining = close_tcp_socket(tcp_sock, session_state, reason);
-    tcp_sock.cancellation.cancel();
     remaining
 }
 
@@ -850,7 +818,6 @@ async fn send_on_active_concurrent_pool(
             Box::pin(async move {
                 let sent = tcp_sock.socket.send(buf, payload).await;
                 if sent.is_some() {
-                    tcp_sock.note_payload_activity();
                     debug!(
                         "Forwarded {} bytes on active fakeTCP {} in pool {}",
                         payload.len(),
@@ -1225,7 +1192,7 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
         }
 
         while let Some(tcp_sock) = set.join_next().await {
-            let (pool_id, tcp_sock) = match tcp_sock {
+            let (_pool_id, tcp_sock) = match tcp_sock {
                 Ok(tcp_sock) => match tcp_sock {
                     Some(tcp_sock) => tcp_sock,
                     None => {

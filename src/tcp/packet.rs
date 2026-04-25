@@ -203,7 +203,7 @@ pub fn build_tcp_packet(
     Ok(total_len + offset)
 }
 
-pub fn parse_ip_packet(buf: &[u8]) -> Option<(IPPacket, tcp::TcpPacket)> {
+pub fn parse_ip_packet(buf: &[u8]) -> Option<(IPPacket<'_>, tcp::TcpPacket<'_>)> {
     if buf.is_empty() {
         return None;
     }
