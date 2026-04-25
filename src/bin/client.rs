@@ -2,7 +2,6 @@ use cfg_if::cfg_if;
 use clap::ArgMatches;
 use clap::{crate_version, Arg, ArgAction, Command};
 use log::{debug, error, info, trace, warn};
-use std::collections::VecDeque;
 use std::fmt;
 use std::fs;
 use std::future::Future;
@@ -443,23 +442,6 @@ impl TcpCloseReason {
     }
 }
 
-#[derive(Clone, Debug)]
-struct ClientCloseEvent {
-    reason: TcpCloseReason,
-    closed_at: Instant,
-    lifetime: Duration,
-    was_active_pool: bool,
-    had_payload_activity: bool,
-}
-
-struct ClientLearningState {
-    recent_events: VecDeque<ClientCloseEvent>,
-    active_send_width: usize,
-    repair_backoff: Duration,
-    next_repair_allowed_at: Instant,
-    stable_ticks: usize,
-}
-
 struct ClientSessionState {
     live_tcp_sockets: AtomicUsize,
     next_tcp_socket_index: AtomicUsize,
@@ -503,11 +485,10 @@ impl ClientSessionState {
 }
 
 struct ClientConcurrentFlowState {
-    active_pool_index: AtomicUsize,
     desired_pool_size: usize,
     next_socket_index: AtomicUsize,
     pool_connect_key: u16,
-    pools: Vec<std::sync::Mutex<Vec<Arc<ClientTcpSocket>>>>,
+    sockets: std::sync::Mutex<Vec<Arc<ClientTcpSocket>>>,
     stack: Arc<Stack>,
     remote_addr: SocketAddr,
     udp_socks: Arc<Vec<Arc<UdpSocket>>>,
@@ -516,7 +497,6 @@ struct ClientConcurrentFlowState {
     packet_received_tx: broadcast::Sender<()>,
     session_state: Arc<ClientSessionState>,
     cancellation: CancellationToken,
-    learning: Mutex<ClientLearningState>,
 }
 
 impl ClientConcurrentFlowState {
@@ -531,19 +511,14 @@ impl ClientConcurrentFlowState {
         packet_received_tx: broadcast::Sender<()>,
         session_state: Arc<ClientSessionState>,
         cancellation: CancellationToken,
-        active_pool: Vec<Arc<ClientTcpSocket>>,
-        standby_pool: Vec<Arc<ClientTcpSocket>>,
+        sockets: Vec<Arc<ClientTcpSocket>>,
         next_socket_index: usize,
     ) -> Self {
         Self {
-            active_pool_index: AtomicUsize::new(0),
             desired_pool_size,
             next_socket_index: AtomicUsize::new(next_socket_index),
             pool_connect_key,
-            pools: vec![
-                std::sync::Mutex::new(active_pool),
-                std::sync::Mutex::new(standby_pool),
-            ],
+            sockets: std::sync::Mutex::new(sockets),
             stack,
             remote_addr,
             udp_socks,
@@ -552,179 +527,36 @@ impl ClientConcurrentFlowState {
             packet_received_tx,
             session_state,
             cancellation,
-            learning: Mutex::new(ClientLearningState {
-                recent_events: VecDeque::with_capacity(32),
-                active_send_width: desired_pool_size.max(1),
-                repair_backoff: Duration::from_secs(1),
-                next_repair_allowed_at: Instant::now(),
-                stable_ticks: 0,
-            }),
         }
     }
 
-    fn active_pool_index(&self) -> usize {
-        self.active_pool_index.load(Ordering::Acquire) % 2
-    }
-
-    fn standby_pool_index(&self) -> usize {
-        1 - self.active_pool_index()
-    }
-
-    fn snapshot_pool_sockets(&self, pool_id: usize) -> Vec<Arc<ClientTcpSocket>> {
-        self.pools[pool_id]
+    fn snapshot_sockets(&self) -> Vec<Arc<ClientTcpSocket>> {
+        self.sockets
             .lock()
-            .map(|pool| pool.clone())
+            .map(|sockets| sockets.clone())
             .unwrap_or_default()
     }
 
-    fn live_pool_size(&self, pool_id: usize) -> usize {
-        self.pools[pool_id]
+    fn live_socket_count(&self) -> usize {
+        self.sockets
             .lock()
-            .map(|pool| pool.iter().filter(|sock| sock.is_alive()).count())
+            .map(|sockets| sockets.iter().filter(|sock| sock.is_alive()).count())
             .unwrap_or(0)
-    }
-
-    fn active_send_width(&self) -> usize {
-        self.learning
-            .lock()
-            .map(|learning| learning.active_send_width.max(1))
-            .unwrap_or(1)
-    }
-
-    fn note_stable_tick(&self) {
-        if let Ok(mut learning) = self.learning.lock() {
-            learning.stable_ticks = learning.stable_ticks.saturating_add(1);
-            if learning.stable_ticks >= 15 {
-                learning.stable_ticks = 0;
-                if learning.active_send_width < self.desired_pool_size {
-                    learning.active_send_width += 1;
-                    info!(
-                        "Increasing concurrent active send width for {} to {}",
-                        self.remote_addr, learning.active_send_width
-                    );
-                }
-                learning.repair_backoff =
-                    std::cmp::max(Duration::from_secs(1), learning.repair_backoff / 2);
-                learning.next_repair_allowed_at = Instant::now();
-            }
-        }
-    }
-
-    fn record_close_event(&self, event: ClientCloseEvent) {
-        if let Ok(mut learning) = self.learning.lock() {
-            while learning
-                .recent_events
-                .front()
-                .map(|old| event.closed_at.duration_since(old.closed_at) > Duration::from_secs(120))
-                .unwrap_or(false)
-            {
-                learning.recent_events.pop_front();
-            }
-            if learning.recent_events.len() == 32 {
-                learning.recent_events.pop_front();
-            }
-            learning.recent_events.push_back(event.clone());
-
-            if !event.reason.is_learning_relevant() {
-                return;
-            }
-
-            learning.stable_ticks = 0;
-            let mut severity = match event.reason {
-                TcpCloseReason::HandshakeSendFailure => 4usize,
-                TcpCloseReason::FirstPacketSendFailure => 4,
-                TcpCloseReason::TcpSendFailure => 3,
-                TcpCloseReason::TcpRecvEof => 2,
-                TcpCloseReason::UdpForwardFailure => 2,
-                TcpCloseReason::RepairConnectFailure => 1,
-                TcpCloseReason::SessionCancellation | TcpCloseReason::SocketRetire => 0,
-            };
-            if event.was_active_pool {
-                severity += 2;
-            }
-            if event.had_payload_activity {
-                severity += 1;
-            }
-            if event.lifetime < Duration::from_secs(3) {
-                severity += 2;
-            } else if event.lifetime < Duration::from_secs(15) {
-                severity += 1;
-            }
-            let recent_relevant = learning
-                .recent_events
-                .iter()
-                .filter(|old| {
-                    old.reason.is_learning_relevant()
-                        && event.closed_at.duration_since(old.closed_at) <= Duration::from_secs(30)
-                })
-                .count();
-            if recent_relevant >= 3 {
-                severity += 2;
-            }
-
-            let reduction = std::cmp::max(1, severity / 3);
-            let previous = learning.active_send_width;
-            learning.active_send_width = learning
-                .active_send_width
-                .saturating_sub(reduction)
-                .max(1);
-            learning.repair_backoff =
-                std::cmp::min(Duration::from_secs(30), learning.repair_backoff.saturating_mul(2));
-            learning.next_repair_allowed_at = Instant::now() + learning.repair_backoff;
-            if learning.active_send_width != previous {
-                info!(
-                    "Adaptive policy reduced concurrent active send width for {} from {} to {} after {:?}",
-                    self.remote_addr,
-                    previous,
-                    learning.active_send_width,
-                    event.reason
-                );
-            }
-        }
-    }
-
-    fn switch_to_standby_pool(&self) -> bool {
-        let previous_active = self.active_pool_index();
-        let standby_pool_index = self.standby_pool_index();
-        if self.live_pool_size(standby_pool_index) == 0 {
-            return false;
-        }
-
-        self.active_pool_index
-            .store(standby_pool_index, Ordering::Release);
-        let retired = self.snapshot_pool_sockets(previous_active);
-        for tcp_sock in retired {
-            if tcp_sock.is_alive() {
-                retire_tcp_socket(
-                    &tcp_sock,
-                    &self.session_state,
-                    TcpCloseReason::SocketRetire,
-                );
-            }
-        }
-        info!(
-            "Failing over UDP flow from fakeTCP pool {} to standby pool {}",
-            previous_active, standby_pool_index
-        );
-        true
     }
 
     fn next_socket_index(&self) -> usize {
         self.next_socket_index.fetch_add(1, Ordering::AcqRel)
     }
 
-    async fn create_tcp_socket(
-        self: &Arc<Self>,
-        pool_id: usize,
-    ) -> io::Result<Arc<ClientTcpSocket>> {
+    async fn create_tcp_socket(self: &Arc<Self>) -> io::Result<Arc<ClientTcpSocket>> {
         let socket_index = self.next_socket_index();
         let mut buf = [0u8; MAX_PACKET_LEN];
         let (tcp_sock, _) = self
             .stack
             .connect(&mut buf, self.remote_addr, self.pool_connect_key as u32)
             .await
-            .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionRefused, "unable to create standby tcp socket"))?;
-        let tcp_sock = Arc::new(ClientTcpSocket::new(socket_index, pool_id, tcp_sock));
+            .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionRefused, "unable to create pooled tcp socket"))?;
+        let tcp_sock = Arc::new(ClientTcpSocket::new(socket_index, 0, tcp_sock));
         self.session_state.note_tcp_socket_opened();
         Ok(tcp_sock)
     }
@@ -770,35 +602,28 @@ impl ClientConcurrentFlowState {
         });
     }
 
-    async fn repair_pool(self: &Arc<Self>, pool_id: usize) {
+    async fn replenish_pool(self: &Arc<Self>) {
         let missing = {
-            if let Ok(mut pool) = self.pools[pool_id].lock() {
-                pool.retain(|sock| sock.is_alive());
-                self.desired_pool_size.saturating_sub(pool.len())
+            if let Ok(mut sockets) = self.sockets.lock() {
+                sockets.retain(|sock| sock.is_alive());
+                self.desired_pool_size.saturating_sub(sockets.len())
             } else {
                 0
             }
         };
 
         for _ in 0..missing {
-            match self.create_tcp_socket(pool_id).await {
+            match self.create_tcp_socket().await {
                 Ok(tcp_sock) => {
-                    if let Ok(mut pool) = self.pools[pool_id].lock() {
-                        pool.push(tcp_sock.clone());
+                    if let Ok(mut sockets) = self.sockets.lock() {
+                        sockets.push(tcp_sock.clone());
                     }
                     self.spawn_tcp_loop(tcp_sock);
                 }
                 Err(err) => {
-                    self.record_close_event(ClientCloseEvent {
-                        reason: TcpCloseReason::RepairConnectFailure,
-                        closed_at: Instant::now(),
-                        lifetime: Duration::ZERO,
-                        was_active_pool: pool_id == self.active_pool_index(),
-                        had_payload_activity: false,
-                    });
                     debug!(
-                        "Unable to repair standby tcp socket in pool {} for {}: {err}",
-                        pool_id, self.remote_addr
+                        "Unable to replenish pooled tcp socket for {}: {err}",
+                        self.remote_addr
                     );
                     break;
                 }
@@ -814,32 +639,12 @@ async fn run_concurrent_pool_maintainer(state: Arc<ClientConcurrentFlowState>) {
             break;
         }
 
-        let active_pool = state.active_pool_index();
-        let standby_pool = state.standby_pool_index();
-        let active_live = state.live_pool_size(active_pool);
-        let standby_live = state.live_pool_size(standby_pool);
-
-        if active_live < state.desired_pool_size && standby_live > 0 {
-            if !state.switch_to_standby_pool() {
-                if state.session_state.live_tcp_sockets() == 0 {
-                    state.cancellation.cancel();
-                    break;
-                }
-            }
-        } else if active_live == 0 && state.session_state.live_tcp_sockets() == 0 {
+        if state.live_socket_count() == 0 && state.session_state.live_tcp_sockets() == 0 {
             state.cancellation.cancel();
             break;
         }
 
-        let should_repair = state
-            .learning
-            .lock()
-            .map(|learning| Instant::now() >= learning.next_repair_allowed_at)
-            .unwrap_or(true);
-        if should_repair {
-            state.repair_pool(state.standby_pool_index()).await;
-        }
-        state.note_stable_tick();
+        state.replenish_pool().await;
     }
 }
 
@@ -1033,13 +838,9 @@ async fn send_on_active_concurrent_pool(
     buf: &mut [u8],
     payload: &[u8],
 ) -> bool {
-    let mut active_pool = state.snapshot_pool_sockets(state.active_pool_index());
+    let mut active_pool = state.snapshot_sockets();
     active_pool.retain(|sock| sock.is_alive());
     active_pool.sort_by_key(|sock| sock.index);
-    let width = state.active_send_width();
-    if active_pool.len() > width {
-        active_pool.truncate(width);
-    }
     send_on_live_tcp_socket_with_sender(
         &active_pool,
         &state.session_state,
@@ -1070,27 +871,11 @@ fn close_tcp_socket_in_concurrent_mode(
     flow_state: &ClientConcurrentFlowState,
     reason: TcpCloseReason,
 ) -> usize {
-    let was_active_pool = tcp_sock.pool_id == flow_state.active_pool_index();
     let remaining = close_tcp_socket(tcp_sock, &flow_state.session_state, reason);
-    flow_state.record_close_event(ClientCloseEvent {
-        reason,
-        closed_at: Instant::now(),
-        lifetime: tcp_sock.created_at.elapsed(),
-        was_active_pool,
-        had_payload_activity: tcp_sock.had_payload_activity(),
-    });
     if remaining == 0 {
         flow_state.cancellation.cancel();
         return 0;
     }
-
-    if tcp_sock.pool_id == flow_state.active_pool_index()
-        && flow_state.live_pool_size(tcp_sock.pool_id) < flow_state.desired_pool_size
-        && flow_state.live_pool_size(flow_state.standby_pool_index()) > 0
-    {
-        flow_state.switch_to_standby_pool();
-    }
-
     remaining
 }
 
@@ -1420,45 +1205,23 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
         };
         next_socket_index += 1;
 
-        let mut active_pool = vec![active_primary];
-        let mut standby_pool = Vec::with_capacity(tcp_socks_amount);
+        let mut tcp_pool = vec![active_primary];
         let mut set = JoinSet::new();
 
         for offset in 1..tcp_socks_amount {
-            let active_stack = stack.clone();
+            let pooled_stack = stack.clone();
             let socket_index = next_socket_index;
             next_socket_index += 1;
             set.spawn(async move {
                 let mut buf = [0u8; MAX_PACKET_LEN];
                 let (tcp_sock, _) =
-                    active_stack.connect(&mut buf, remote_addr, first_port as u32).await?;
+                    pooled_stack.connect(&mut buf, remote_addr, first_port as u32).await?;
                 Some((0usize, Arc::new(ClientTcpSocket::new(socket_index, 0, tcp_sock))))
             });
-            let standby_stack = stack.clone();
-            let socket_index = next_socket_index;
-            next_socket_index += 1;
-            set.spawn(async move {
-                let mut buf = [0u8; MAX_PACKET_LEN];
-                let (tcp_sock, _) =
-                    standby_stack.connect(&mut buf, remote_addr, first_port as u32).await?;
-                Some((1usize, Arc::new(ClientTcpSocket::new(socket_index, 1, tcp_sock))))
-            });
             debug!(
-                "Creating concurrent active/standby tcp pair {} for {addr} using pool key {first_port}.",
+                "Creating pooled tcp socket {} for {addr} using pool key {first_port}.",
                 offset
             );
-        }
-
-        {
-            let stack = stack.clone();
-            let socket_index = next_socket_index;
-            next_socket_index += 1;
-            set.spawn(async move {
-                let mut buf = [0u8; MAX_PACKET_LEN];
-                let (tcp_sock, _) =
-                    stack.connect(&mut buf, remote_addr, first_port as u32).await?;
-                Some((1usize, Arc::new(ClientTcpSocket::new(socket_index, 1, tcp_sock))))
-            });
         }
 
         while let Some(tcp_sock) = set.join_next().await {
@@ -1479,27 +1242,20 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
                     continue;
                 }
             };
-            if pool_id == 0 {
-                active_pool.push(tcp_sock);
-            } else {
-                standby_pool.push(tcp_sock);
-            }
+            tcp_pool.push(tcp_sock);
         }
 
-        active_pool.sort_by_key(|sock| sock.index);
-        standby_pool.sort_by_key(|sock| sock.index);
+        tcp_pool.sort_by_key(|sock| sock.index);
 
-        if active_pool.is_empty() && standby_pool.is_empty() {
+        if tcp_pool.is_empty() {
             error!(
-                "No concurrent or standby tcp sockets could be established for {addr}, abandoning session"
+                "No pooled tcp sockets could be established for {addr}, abandoning session"
             );
             cancellation.cancel();
             continue 'main_loop;
         }
 
-        let session_state = Arc::new(ClientSessionState::new(
-            active_pool.len() + standby_pool.len(),
-        ));
+        let session_state = Arc::new(ClientSessionState::new(tcp_pool.len()));
         let concurrent_state = Arc::new(ClientConcurrentFlowState::new(
             tcp_socks_amount,
             first_port,
@@ -1511,24 +1267,23 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
             packet_received_tx.clone(),
             session_state.clone(),
             cancellation.clone(),
-            active_pool,
-            standby_pool,
+            tcp_pool,
             next_socket_index,
         ));
 
-                {
-                    let active_pool = concurrent_state.snapshot_pool_sockets(0);
-                    for tcp_sock in active_pool.iter() {
-                        let mut buf = [0u8; MAX_PACKET_LEN];
-                        let tcp_connect = TcpConnect {
+        {
+            let pool = concurrent_state.snapshot_sockets();
+            for tcp_sock in pool.iter() {
+                let mut buf = [0u8; MAX_PACKET_LEN];
+                let tcp_connect = TcpConnect {
                     udp_socks: udp_socks.clone(),
-                            encryption: encryption.clone(),
-                            packet_received_tx: packet_received_tx.clone(),
-                            handshake_packet: handshake_packet.clone(),
-                            cancellation: cancellation.clone(),
-                            tcp_socket_cancellation: tcp_sock.cancellation.clone(),
-                            first_packet: None,
-                        };
+                    encryption: encryption.clone(),
+                    packet_received_tx: packet_received_tx.clone(),
+                    handshake_packet: handshake_packet.clone(),
+                    cancellation: cancellation.clone(),
+                    tcp_socket_cancellation: tcp_sock.cancellation.clone(),
+                    first_packet: None,
+                };
                 let tcp_sock = tcp_sock.clone();
                 let flow_state = concurrent_state.clone();
                 tokio::spawn(async move {
@@ -1561,37 +1316,30 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
             }
         }
 
+        tokio::spawn(run_concurrent_pool_maintainer(concurrent_state.clone()));
+
+        let mut initial_send_buf = [0u8; MAX_PACKET_LEN];
+        if !send_on_active_concurrent_pool(
+            &concurrent_state,
+            &mut initial_send_buf,
+            &buf_r[..size],
+        )
+        .await
         {
-            let standby_pool = concurrent_state.snapshot_pool_sockets(1);
-            for tcp_sock in standby_pool.iter() {
-                concurrent_state.spawn_tcp_loop(tcp_sock.clone());
-            }
-                }
+            error!(
+                "Unable to forward initial UDP payload for {addr} to remote {remote_addr}"
+            );
+            concurrent_state.cancellation.cancel();
+            continue 'main_loop;
+        }
+        debug!(
+            "Forwarded initial UDP payload of {} bytes for {} to remote {}",
+            size,
+            addr,
+            remote_addr
+        );
 
-                tokio::spawn(run_concurrent_pool_maintainer(concurrent_state.clone()));
-
-                let mut initial_send_buf = [0u8; MAX_PACKET_LEN];
-                if !send_on_active_concurrent_pool(
-                    &concurrent_state,
-                    &mut initial_send_buf,
-                    &buf_r[..size],
-                )
-                .await
-                {
-                    error!(
-                        "Unable to forward initial UDP payload for {addr} to remote {remote_addr}"
-                    );
-                    concurrent_state.cancellation.cancel();
-                    continue 'main_loop;
-                }
-                debug!(
-                    "Forwarded initial UDP payload of {} bytes for {} to remote {}",
-                    size,
-                    addr,
-                    remote_addr
-                );
-
-                for udp_sock in udp_socks.iter() {
+        for udp_sock in udp_socks.iter() {
             let udp_sock = udp_sock.clone();
             let mut packet_received_rx = packet_received_tx.subscribe();
             let packet_received_tx = packet_received_tx.clone();
@@ -1635,18 +1383,7 @@ async fn main_async(matches: ArgMatches) -> io::Result<()> {
                                     &buf_udp[..size],
                                 )
                                 .await;
-                                if sent {
-                                    true
-                                } else if concurrent_state.switch_to_standby_pool() {
-                                    send_on_active_concurrent_pool(
-                                        &concurrent_state,
-                                        &mut buf,
-                                        &buf_udp[..size],
-                                    )
-                                    .await
-                                } else {
-                                    false
-                                }
+                                sent
                             };
                             if !sent
                             {
