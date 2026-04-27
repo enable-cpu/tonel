@@ -1,7 +1,9 @@
 # Docker Deployment
 
-This project ships a user-level `systemd` service for running `tonelc` inside a
-privileged Docker container on the local machine.
+This project supports two Docker-oriented deployment modes:
+
+- local user-level `systemd` for running `tonelc` inside a privileged Docker container
+- formal published OCI images for `tonelc` and `tonels` via GHCR
 
 The intended use case is:
 
@@ -26,6 +28,43 @@ The image contains:
 
 This lets the container rebuild `tonelc` from the current workspace before
 starting it.
+
+## Published Images
+
+The repository root [`Dockerfile`](../Dockerfile) defines two formal targets:
+
+- `tonelc`
+- `tonels`
+
+The GitHub Actions workflow [`container.yml`](../.github/workflows/container.yml)
+publishes them automatically to GHCR on pushes to `main` and on release tags.
+
+Image names:
+
+- `ghcr.io/<owner>/tonelc`
+- `ghcr.io/<owner>/tonels`
+
+Build locally:
+
+```bash
+docker buildx build --target tonelc -t ghcr.io/<owner>/tonelc:latest .
+docker buildx build --target tonels -t ghcr.io/<owner>/tonels:latest .
+```
+
+Push manually:
+
+```bash
+echo "$GHCR_TOKEN" | docker login ghcr.io -u <owner> --password-stdin
+docker push ghcr.io/<owner>/tonelc:latest
+docker push ghcr.io/<owner>/tonels:latest
+```
+
+The published images are runtime images, not the local E2E helper image. They contain:
+
+- the corresponding release binary
+- `iptables`
+- `iproute2`
+- CA certificates
 
 ## Install The User Service
 
@@ -78,6 +117,13 @@ This is required because `tonelc` needs to:
 Even though `tonelc` runs in Docker, the listener is on the host network
 namespace. For example, if `TONELC_ARGS` contains `--local 127.0.0.1:1111`,
 local HY2 should target `127.0.0.1:1111`.
+
+The published GHCR images usually need the same runtime model:
+
+```bash
+docker run --rm --network host --privileged ghcr.io/<owner>/tonelc:latest ...
+docker run --rm --network host --privileged ghcr.io/<owner>/tonels:latest ...
+```
 
 ## Verification
 

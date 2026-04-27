@@ -125,6 +125,39 @@ systemctl --user enable --now tonelc-docker.service
 This unit runs `tonelc` inside a privileged host-network Docker container and is intended for
 local validation against a remote `tonels` deployment.
 
+### Published container images
+
+The repository now includes a formal multi-stage [`Dockerfile`](Dockerfile) and a GitHub Actions
+workflow at [`.github/workflows/container.yml`](.github/workflows/container.yml) that publishes
+two GHCR images automatically on pushes to `main` and release tags:
+
+- `ghcr.io/<owner>/tonelc`
+- `ghcr.io/<owner>/tonels`
+
+These images are built from dedicated Docker targets rather than the local E2E helper image.
+
+Build locally:
+
+```bash
+docker buildx build --target tonelc -t ghcr.io/<owner>/tonelc:latest .
+docker buildx build --target tonels -t ghcr.io/<owner>/tonels:latest .
+```
+
+Push manually:
+
+```bash
+echo "$GHCR_TOKEN" | docker login ghcr.io -u <owner> --password-stdin
+docker push ghcr.io/<owner>/tonelc:latest
+docker push ghcr.io/<owner>/tonels:latest
+```
+
+Published image usage still requires Linux network privileges. Typical runtime flags are:
+
+```bash
+docker run --rm --network host --privileged ghcr.io/<owner>/tonelc:latest ...
+docker run --rm --network host --privileged ghcr.io/<owner>/tonels:latest ...
+```
+
 ## Server
 
 First, install the Tonel server or use the latest prebuild binaries from [Releases](https://github.com/sabify/tonel/releases/latest):
