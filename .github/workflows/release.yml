@@ -50,7 +50,7 @@ jobs:
           cd target/${{ matrix.target }}/release
           zip tonel_${{ matrix.target }}.zip tonelc tonels
       - name: Upload GitHub Assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: target/${{ matrix.target }}/release/*.zip
           prerelease: ${{ contains(github.ref, '-') }}
@@ -80,7 +80,7 @@ jobs:
           cd target/${{ matrix.target }}/release
           zip tonel_${{ matrix.target }}.zip tonelc tonels
       - name: Upload GitHub Assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: target/${{ matrix.target }}/release/*.zip
           prerelease: ${{ contains(github.ref, '-') }}
